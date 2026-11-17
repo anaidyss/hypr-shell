@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Prints `gray` when the image is essentially grayscale (no meaningful hue), `color` otherwise.
+
+matugen falls back to a blue accent for grayscale sources; the wallpaper switcher uses
+this to pick the neutral scheme instead.
+"""
+import sys
+from PIL import Image, ImageStat
+
+img = Image.open(sys.argv[1])
+img.draft("RGB", (128, 128))
+img = img.convert("RGB")
+img.thumbnail((64, 64))
+saturation = ImageStat.Stat(img.convert("HSV")).median[1]
+print("gray" if saturation < 8 else "color")

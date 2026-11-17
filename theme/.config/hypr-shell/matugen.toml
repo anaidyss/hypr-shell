@@ -1,0 +1,10 @@
+[config]
+
+[templates.quickshell]
+input_path = "~/.config/hypr-shell/templates/colors.json"
+output_path = "~/.local/state/hypr-shell/colors.json"
+
+
+[templates.hyprland_lua]
+input_path = "~/.config/hypr-shell/templates/colors.lua"
+output_path = "~/.local/state/hypr-shell/colors.lua"

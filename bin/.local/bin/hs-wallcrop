@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Crop a wallpaper to the chosen region (source pixels), keep the result and apply it.
+
+hs-wallcrop <image> <x> <y> <w> <h>
+
+The cropped picture (JPEG, same name) takes the place of the original in the wallpaper folder, and
+the original moves to the originals folder (~/Pictures/Wallpapers/Originals, or
+$HS_WALLPAPER_ORIGINALS), so the aspect ratio now matches and the question is not asked again.
+An image from outside the wallpaper folder is left where it is: only the cropped copy is added.
+"""
+import os
+import shutil
+import subprocess
+import sys
+
+from PIL import Image
+
+home = os.path.expanduser("~")
+src = os.path.realpath(sys.argv[1])
+x, y, w, h = (float(sys.argv[i]) for i in (2, 3, 4, 5))
+
+wall_dir = os.path.realpath(os.environ.get("HS_WALLPAPER_DIR") or os.path.join(home, ".config", "hypr-shell", "wallpapers"))
+orig_dir = os.path.expanduser(os.environ.get("HS_WALLPAPER_ORIGINALS") or os.path.join(home, "Pictures", "Wallpapers", "Originals"))
+
+
+def unique(directory, name):
+    stem, ext = os.path.splitext(name)
+    path = os.path.join(directory, name)
+    n = 1
+    while os.path.exists(path):
+        n += 1
+        path = os.path.join(directory, "%s-%d%s" % (stem, n, ext))
+    return path
+
+
+im = Image.open(src).convert("RGB")
+iw, ih = im.size
+x0 = max(0, min(iw - 1, int(round(x))))
+y0 = max(0, min(ih - 1, int(round(y))))
+x1 = max(x0 + 1, min(iw, int(round(x + w))))
+y1 = max(y0 + 1, min(ih, int(round(y + h))))
+
+os.makedirs(wall_dir, exist_ok=True)
+stem = os.path.splitext(os.path.basename(src))[0]
+part = os.path.join(wall_dir, "." + stem + ".part")
+# The cropped copy is written first: a failure leaves the original untouched.
+im.crop((x0, y0, x1, y1)).save(part, format="JPEG", quality=92)
+
+if os.path.dirname(src) == wall_dir:
+    os.makedirs(orig_dir, exist_ok=True)
+    shutil.move(src, unique(orig_dir, os.path.basename(src)))
+
+dst = unique(wall_dir, stem + ".jpg")
+os.replace(part, dst)
+subprocess.run([os.path.join(home, ".local", "bin", "hs-wallpaper"), dst], check=False)

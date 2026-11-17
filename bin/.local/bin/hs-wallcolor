@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Classify a wallpaper for the frame color.
+
+Writes ~/.local/state/hypr-shell/wallcolor.json:
+  type  "duo"   mostly black plus one concentrated hue (two-color picture)
+        "photo" many hues (a normal photo)
+        "gray"  little or no color
+  color for "duo" a vivid deep version of the second color; "photo"/"gray" the neutral panel gray.
+  flat  true when one background color covers most of the picture and its edges (the solid design mode)
+  bg    that background color; solid is the same color with the lightness capped so light text stays readable.
+  light true when the picture's background is light (a flat light background, or a light median lightness): the
+        "auto" color mode then picks the light scheme.
+"""
+import json
+import math
+import os
+import sys
+
+from PIL import Image
+
+img = Image.open(sys.argv[1])
+img.draft("RGB", (320, 320))
+img = img.convert("RGB")
+img.thumbnail((160, 160))
+px = list(getattr(img, "get_flattened_data", img.getdata)())
+
+
+def to_linear(c):
+    c /= 255.0
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def to_srgb(c):
+    c = max(0.0, min(1.0, c))
+    return 255 * (12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055)
+
+
+def oklab(r, g, b):
+    r, g, b = to_linear(r), to_linear(g), to_linear(b)
+    l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+    m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+    s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+    return (
+        0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+        1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    )
+
+
+def linear_rgb(L, a, b):
+    l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3
+    m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3
+    s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3
+    return (
+        4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+        -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+        -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+    )
+
+
+def hex_ok(L, C, hue):
+    for _ in range(24):
+        rgb = linear_rgb(L, C * math.cos(hue), C * math.sin(hue))
+        if all(-0.0005 <= v <= 1.0005 for v in rgb):
+            break
+        C *= 0.85
+    return "#%02x%02x%02x" % tuple(round(to_srgb(v)) for v in rgb)
+
+
+labs = [oklab(*p) for p in px]
+dark = sum(1 for L, a, b in labs if L < 0.15)
+colored = [(L, a, b) for L, a, b in labs if L > 0.18 and math.hypot(a, b) > 0.03]
+
+if not colored:
+    kind, color, accent, accent_text = "gray", "#2a2a2c", None, None
+else:
+    hues = [math.atan2(b, a) for _, a, b in colored]
+    sx = sum(math.cos(h) for h in hues)
+    sy = sum(math.sin(h) for h in hues)
+    mean_hue = math.atan2(sy, sx)
+    concentration = math.hypot(sx, sy) / len(hues)  # 0 spread, 1 one hue
+    frac_dark = dark / len(labs)
+    if frac_dark > 0.25 and concentration > 0.7:
+        kind = "duo"
+        color = hex_ok(0.38, 0.13, mean_hue)          # deep frame color
+        accent = hex_ok(0.60, 0.18, mean_hue)         # vivid accent
+        accent_text = hex_ok(0.14, 0.05, mean_hue)    # dark text on the accent
+    else:
+        kind, color, accent, accent_text = "photo", "#2a2a2c", None, None
+
+# Flat background: bin the picture in OKLab, take the biggest bin plus its neighbours, and require that it also
+# fills the border ring (where the frame sits). Photos with gradients and noise never reach these coverages.
+W, H = img.size
+def cell(L, a, b):
+    return (round(L / 0.05), round(a / 0.03), round(b / 0.03))
+bins = {}
+for lab in labs:
+    bins.setdefault(cell(*lab), []).append(lab)
+top = max(bins, key=lambda k: len(bins[k]))
+cluster = [lab for k, v in bins.items() if max(abs(k[i] - top[i]) for i in range(3)) <= 1 for lab in v]
+members = {cell(*lab) for lab in cluster}
+ring = [labs[y * W + x] for y in range(H) for x in range(W) if x < 6 or y < 6 or x >= W - 6 or y >= H - 6]
+in_ring = sum(1 for lab in ring if max(abs(cell(*lab)[i] - top[i]) for i in range(3)) <= 1) / max(1, len(ring))
+flat = len(cluster) / len(labs) >= 0.40 and in_ring >= 0.60
+bg = solid = None
+if flat:
+    n = len(cluster)
+    mL, ma, mb = (sum(c[i] for c in cluster) / n for i in range(3))
+    def to_hex(L, a, b):
+        rgb = linear_rgb(L, a, b)
+        return "#%02x%02x%02x" % tuple(round(to_srgb(v)) for v in rgb)
+    bg = to_hex(mL, ma, mb)
+    k = min(1.0, 0.30 / mL) if mL > 0 else 1.0
+    solid = hex_ok(mL * k, math.hypot(ma, mb) * k, math.atan2(mb, ma))
+
+if flat:
+    light = mL > 0.72
+else:
+    ls = sorted(lab[0] for lab in labs)
+    light = ls[len(ls) // 2] > 0.66
+
+state = os.path.join(os.path.expanduser("~"), ".local", "state", "hypr-shell")
+os.makedirs(state, exist_ok=True)
+out = {"type": kind, "color": color, "flat": flat, "light": light}
+if flat:
+    out["bg"] = bg
+    out["solid"] = solid
+if accent is not None:
+    out["accent"] = accent
+    out["accent_text"] = accent_text
+with open(os.path.join(state, "wallcolor.json.tmp"), "w") as f:
+    json.dump(out, f, indent=2)
+os.replace(os.path.join(state, "wallcolor.json.tmp"), os.path.join(state, "wallcolor.json"))

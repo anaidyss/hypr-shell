@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Locks the session with the Quickshell lock screen and watches it while locked.
+# If the shell is not running, or dies while the session is locked, hyprlock takes over
+# (needs misc.allow_session_lock_restore in Hyprland).
+# Usage: hs-lock [--wait]   (--wait: wait for the shell to come up first; used at login)
+# A lock the shell already holds is not an error: the script just guards it.
+set -u
+
+CONFIG_DIR="$HOME/.config/hypr-shell"
+QS=(qs -c hypr-shell)
+
+# One guardian at a time: hypridle, a key bind and the session menu may all ask for a lock.
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/hs-lock.lock"
+flock -n 9 || exit 0
+
+pgrep -x hyprlock >/dev/null && exit 0
+
+state() { timeout 2 "${QS[@]}" ipc call lock state 2>/dev/null; }
+
+fallback() {
+    hyprctl switchxkblayout all 0 >/dev/null 2>&1
+    exec hyprlock -c "$CONFIG_DIR/hyprlock.conf"
+}
+
+# --wait: called right after login, when the shell may still be starting (and may lock by itself); give it up to 15 s.
+if [[ "${1:-}" == --wait ]]; then
+    for _ in $(seq 30); do
+        s="$(state)"
+        [[ "$s" == unlocked || "$s" == locked ]] && break
+        sleep 0.5
+    done
+fi
+
+s="$(state)"
+[[ "$s" == unlocked || "$s" == locked ]] || fallback
+
+[[ "$s" == locked ]] || timeout 3 "${QS[@]}" ipc call lock lock >/dev/null 2>&1 || fallback
+
+# Wait for the lock to engage (up to 3 s).
+for _ in $(seq 30); do
+    [[ "$(state)" == locked ]] && break
+    sleep 0.1
+done
+[[ "$(state)" == locked ]] || fallback
+
+# Guard: unlocked means we are done; three failed answers in a row mean the shell is gone.
+misses=0
+while true; do
+    s="$(state)"
+    case "$s" in
+        unlocked) exit 0 ;;
+        locked) misses=0 ;;
+        *) misses=$((misses + 1)); (( misses >= 3 )) && fallback ;;
+    esac
+    sleep 1
+done

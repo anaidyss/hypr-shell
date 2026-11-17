@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+# Drive manager for the shell's Drives branch. Removable drives are listed per physical disk (a flashed ISO
+# leaves several partitions on one stick, and formatting or writing works on the whole disk); internal data
+# partitions are listed separately for the branch's "show all" switch. Everything goes through udisks2, so
+# nothing here needs root; udisks asks polkit where it has to.
+#
+#   hs-drives list                     # one-shot JSON {"disks": [...], "internal": [...]}
+#   hs-drives watch                    # the same JSON as a line on every change (2 s poll)
+#   hs-drives caps                     # JSON {"fs": {"ext4": true, "exfat": false, ...}}
+#   hs-drives mount    /dev/sdb1
+#   hs-drives unmount  /dev/sdb1
+#   hs-drives eject    /dev/sdb        # unmount every partition, then power the disk off
+#   hs-drives open     /dev/sdb[1]     # mount if needed, then open the mount point in the file manager
+#   hs-drives terminal /dev/sdb[1] [subdir]  # mount if needed, then a terminal there
+#   hs-drives ls       /dev/sdb[1] [subdir]  # JSON listing of a mounted filesystem (stays inside it)
+#   hs-drives rename   /dev/sdb[1] NAME      # filesystem label (unmounts and remounts around it if needed)
+#   hs-drives format   /dev/sdb FS NAME [gpt|dos] [quick|zero]
+#                                      # new partition table + one partition; removable disks only, the
+#                                      # shell asks for confirmation first
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+MKFS = {
+    "ext4": "mkfs.ext4", "exfat": "mkfs.exfat", "vfat": "mkfs.vfat", "ntfs": "mkfs.ntfs",
+    "btrfs": "mkfs.btrfs", "f2fs": "mkfs.f2fs", "xfs": "mkfs.xfs", "udf": "mkudffs",
+}
+# Partition types per table: Windows-readable filesystems get "basic data", the rest "Linux filesystem".
+GPT_TYPE = {"win": "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7", "linux": "0fc63daf-8483-4772-8e79-3d69d8477de4"}
+DOS_TYPE = {"vfat": "0x0c", "exfat": "0x07", "ntfs": "0x07", "udf": "0x07"}
+WIN_FS = ("vfat", "exfat", "ntfs", "udf")
+OWNED_FS = ("ext4", "btrfs", "xfs", "f2fs")  # root directory is handed to the user ("take-ownership")
+LABEL_MAX = {"vfat": 11, "exfat": 15, "ntfs": 32, "ext4": 16, "btrfs": 255, "f2fs": 512, "xfs": 12, "udf": 126}
+
+SYSTEM_MOUNTS = ("/", "/boot", "/efi", "/boot/efi", "/var", "/usr", "/home")
+SKIP_FS = ("swap", "crypto_LUKS", "LVM2_member", "linux_raid_member", "squashfs", "")
+
+
+def out(obj):
+    print(json.dumps(obj), flush=True)
+
+
+def fail(msg):
+    out({"ok": False, "msg": msg})
+    sys.exit(0)
+
+
+def lsblk():
+    r = subprocess.run(
+        ["lsblk", "-b", "-J", "-o",
+         "NAME,PATH,TYPE,RM,HOTPLUG,TRAN,SIZE,MOUNTPOINTS,LABEL,VENDOR,MODEL,FSTYPE,FSUSED,FSSIZE,FSVER,PTTYPE,RO"],
+        capture_output=True, text=True,
+    )
+    try:
+        return json.loads(r.stdout or "{}").get("blockdevices", [])
+    except ValueError:
+        return []
+
+
+def mountpoints(node):
+    mp = node.get("mountpoints") or []
+    if isinstance(mp, str):
+        mp = [mp]
+    return [m for m in mp if m and m != "[SWAP]" and "/var/lib/snapd" not in m]
+
+
+def part_card(disk, part):
+    mp = mountpoints(part)
+    return {
+        "dev": part["path"],
+        "name": part["name"],
+        "label": part.get("label") or "",
+        "fstype": part.get("fstype") or "",
+        "fsver": part.get("fsver") or "",
+        "size": part.get("size") or 0,
+        "used": part.get("fsused"),
+        "total": part.get("fssize"),
+        "mountpoint": mp[0] if mp else "",
+        "mounted": bool(mp),
+        "readonly": bool(part.get("ro")),
+        "disk": disk["path"],
+    }
+
+
+def removable(disk):
+    return bool(disk.get("rm")) or bool(disk.get("hotplug")) or disk.get("tran") in ("usb", "mmc")
+
+
+def main_part(parts):
+    # The partition the drive "is": a mountable filesystem, the biggest one (an ISO stick has a large
+    # iso9660 partition and a small EFI one; a normal stick has one partition).
+    fs = [p for p in parts if p["fstype"] not in SKIP_FS]
+    pool = fs or parts
+    return max(range(len(pool)), key=lambda i: pool[i]["size"]) if pool else -1, pool
+
+
+def disk_card(d):
+    children = [c for c in d.get("children", []) if c.get("type") == "part"]
+    parts = [part_card(d, c) for c in children] if children else [part_card(d, d)]
+    idx, pool = main_part(parts)
+    main = pool[idx] if idx >= 0 else None
+    vendor = (d.get("vendor") or "").strip()
+    model = (d.get("model") or "").strip()
+    iso = any(p["fstype"] == "iso9660" for p in parts)
+    labels = {p["label"] for p in parts}
+    ventoy = "Ventoy" in labels and "VTOYEFI" in labels
+    # A camera card: DCIM on the mounted main partition (checked only when mounted, never mounts by itself).
+    camera = bool(main and main["mounted"] and os.path.isdir(os.path.join(main["mountpoint"], "DCIM")))
+    return {
+        "dev": d["path"],
+        "name": d["name"],
+        "model": " ".join(x for x in (vendor, model) if x) or "USB drive",
+        "tran": d.get("tran") or "",
+        "size": d.get("size") or 0,
+        "pttype": d.get("pttype") or "",
+        "parts": parts,
+        "main": main["dev"] if main else "",
+        "label": main["label"] if main else "",
+        "fstype": main["fstype"] if main else "",
+        "mounted": any(p["mounted"] for p in parts),
+        "mountpoint": main["mountpoint"] if main else "",
+        "used": main["used"] if main else None,
+        "total": main["total"] if main else None,
+        "iso": iso and not ventoy,
+        "ventoy": ventoy,
+        "camera": camera,
+        "removable": True,
+    }
+
+
+def internal_ok(part):
+    if (part.get("fstype") or "") in SKIP_FS:
+        return False
+    return not any(m in SYSTEM_MOUNTS or m.startswith("/boot") for m in mountpoints(part))
+
+
+def state():
+    disks, internal = [], []
+    for d in lsblk():
+        if d.get("type") != "disk" or d["name"].startswith(("zram", "loop", "sr")):
+            continue
+        if removable(d):
+            if (d.get("size") or 0) > 0:  # an empty card reader slot reports size 0
+                disks.append(disk_card(d))
+            continue
+        children = [c for c in d.get("children", []) if c.get("type") == "part"] or [d]
+        for c in children:
+            if internal_ok(c):
+                card = part_card(d, c)
+                card["model"] = " ".join(x for x in ((d.get("vendor") or "").strip(), (d.get("model") or "").strip()) if x)
+                card["removable"] = False
+                internal.append(card)
+    return {"disks": disks, "internal": internal}
+
+
+def find(dev):
+    """Returns (disk_card, part_card or None) for a disk or partition path."""
+    st = state()
+    for d in st["disks"]:
+        if d["dev"] == dev:
+            return d, None
+        for p in d["parts"]:
+            if p["dev"] == dev:
+                return d, p
+    for p in st["internal"]:
+        if p["dev"] == dev:
+            return None, p
+    return None, None
+
+
+def run(args):
+    r = subprocess.run(args, capture_output=True, text=True)
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def udisks_msg(msg):
+    # "Error mounting /dev/sdb1: GDBus.Error:org.freedesktop.UDisks2.Error.Failed: ..." -> the last part.
+    msg = msg.strip().splitlines()[-1] if msg.strip() else ""
+    return re.sub(r"^.*GDBus\.Error:[\w.]+:\s*", "", msg)
+
+
+def mount(dev):
+    """Mounts a partition if needed and returns its mount point (or fails)."""
+    _, p = find(dev)
+    if p is None:
+        fail("no such drive")
+    if p["mounted"]:
+        return p["mountpoint"]
+    ok, msg = run(["udisksctl", "mount", "-b", dev, "--no-user-interaction"])
+    if not ok:
+        fail(udisks_msg(msg))
+    m = re.search(r" at (.+?)\.?$", msg)
+    if m:
+        return m.group(1)
+    _, p = find(dev)
+    return p["mountpoint"] if p else fail("mounted, but the mount point is unknown")
+
+
+def target(dev):
+    """A disk path means its main partition."""
+    d, p = find(dev)
+    if p is not None:
+        return p["dev"]
+    if d is not None and d["main"]:
+        return d["main"]
+    fail("nothing to mount on this drive")
+
+
+def inside(base, sub):
+    path = os.path.realpath(os.path.join(base, sub.lstrip("/")))
+    root = os.path.realpath(base)
+    if path != root and not path.startswith(root + os.sep):
+        fail("outside the drive")
+    return path
+
+
+def listing(base, sub):
+    path = inside(base, sub)
+    entries = []
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                try:
+                    isdir = e.is_dir(follow_symlinks=False)
+                    st = e.stat(follow_symlinks=False)
+                    entries.append({"name": e.name, "dir": isdir, "size": 0 if isdir else st.st_size,
+                                    "mtime": int(st.st_mtime), "hidden": e.name.startswith(".")})
+                except OSError:
+                    continue
+    except OSError as ex:
+        fail(ex.strerror or "cannot read")
+    entries.sort(key=lambda x: (not x["dir"], x["name"].lower()))
+    total = len(entries)
+    return {"ok": True, "path": path, "root": os.path.realpath(base), "sub": os.path.relpath(path, os.path.realpath(base)),
+            "count": total, "entries": entries[:400]}
+
+
+def caps():
+    return {"fs": {fs: shutil.which(tool) is not None for fs, tool in MKFS.items()}}
+
+
+# ---- udisks over D-Bus (format needs structured options, busctl is clumsy for that) ----
+
+def dbus():
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+    return Gio, GLib
+
+
+def obj_path(dev):
+    name = dev.removeprefix("/dev/")
+    if not re.fullmatch(r"[A-Za-z0-9]+", name):
+        fail("bad device")
+    return "/org/freedesktop/UDisks2/block_devices/" + name
+
+
+def call(path, iface, method, sig, args, timeout_ms=10 * 60 * 1000):
+    Gio, GLib = dbus()
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    return bus.call_sync("org.freedesktop.UDisks2", path, iface, method, GLib.Variant(sig, args), None,
+                         Gio.DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, timeout_ms, None)
+
+
+def unmount_all(disk):
+    for p in disk["parts"]:
+        if p["mounted"]:
+            ok, msg = run(["udisksctl", "unmount", "-b", p["dev"], "--no-user-interaction"])
+            if not ok:
+                fail("cannot unmount " + p["dev"] + ": " + udisks_msg(msg))
+
+
+def format_disk(dev, fs, label, table, erase):
+    d, p = find(dev)
+    if d is None or p is not None:
+        fail("only a whole removable drive can be formatted here")
+    if fs not in MKFS:
+        fail("unknown filesystem")
+    if shutil.which(MKFS[fs]) is None:
+        fail(MKFS[fs] + " is not installed")
+    if table not in ("gpt", "dos"):
+        fail("bad partition table")
+    label = label[: LABEL_MAX.get(fs, 32)]
+    if fs == "vfat":
+        label = label.upper()
+    unmount_all(d)
+    Gio, GLib = dbus()
+    path = obj_path(dev)
+    opts = {"tear-down": GLib.Variant("b", True)}
+    if erase == "zero":
+        opts["erase"] = GLib.Variant("s", "zero")
+    try:
+        call(path, "org.freedesktop.UDisks2.Block", "Format", "(sa{sv})", (table, opts), 6 * 60 * 60 * 1000)
+        ptype = (GPT_TYPE["win"] if fs in WIN_FS else GPT_TYPE["linux"]) if table == "gpt" else DOS_TYPE.get(fs, "0x83")
+        fopts = {"label": GLib.Variant("s", label)}
+        if fs in OWNED_FS:
+            fopts["take-ownership"] = GLib.Variant("b", True)
+        name = label if table == "gpt" else ""
+        call(path, "org.freedesktop.UDisks2.PartitionTable", "CreatePartitionAndFormat", "(ttssa{sv}sa{sv})",
+             (0, 0, ptype, name, {}, fs, fopts), 60 * 60 * 1000)
+    except GLib.Error as ex:
+        fail(udisks_msg(ex.message))
+    out({"ok": True, "msg": ""})
+
+
+def rename(dev, label):
+    part = target(dev)
+    _, p = find(part)
+    fs = p["fstype"]
+    if fs in LABEL_MAX:
+        label = label[: LABEL_MAX[fs]]
+    if fs == "vfat":
+        label = label.upper()
+    was = p["mounted"]
+    # FAT, exFAT and NTFS labels are written with the filesystem unmounted.
+    if was and fs in WIN_FS:
+        ok, msg = run(["udisksctl", "unmount", "-b", part, "--no-user-interaction"])
+        if not ok:
+            fail(udisks_msg(msg))
+    Gio, GLib = dbus()
+    err = ""
+    try:
+        call(obj_path(part), "org.freedesktop.UDisks2.Filesystem", "SetLabel", "(sa{sv})", (label, {}))
+    except GLib.Error as ex:
+        err = udisks_msg(ex.message)
+    if was and fs in WIN_FS:
+        run(["udisksctl", "mount", "-b", part, "--no-user-interaction"])
+    out({"ok": err == "", "msg": err})
+
+
+def main():
+    argv = sys.argv[1:]
+    cmd = argv[0] if argv else "list"
+
+    if cmd == "list":
+        out(state())
+        return
+    if cmd == "watch":
+        prev = None
+        while True:
+            try:
+                cur = json.dumps(state(), sort_keys=True)
+            except Exception:
+                cur = json.dumps({"disks": [], "internal": []})
+            if cur != prev:
+                prev = cur
+                print(cur, flush=True)
+            time.sleep(2)
+    if cmd == "caps":
+        out(caps())
+        return
+
+    dev = argv[1] if len(argv) > 1 else ""
+    if not dev.startswith("/dev/"):
+        fail("bad device")
+
+    if cmd == "mount":
+        mount(dev)
+        out({"ok": True, "msg": ""})
+    elif cmd == "unmount":
+        ok, msg = run(["udisksctl", "unmount", "-b", dev, "--no-user-interaction"])
+        out({"ok": ok, "msg": "" if ok else udisks_msg(msg)})
+    elif cmd == "eject":
+        d, _ = find(dev)
+        if d is None:
+            fail("only removable drives can be ejected")
+        unmount_all(d)
+        subprocess.run(["sync"])
+        ok, msg = run(["udisksctl", "power-off", "-b", d["dev"], "--no-user-interaction"])
+        out({"ok": ok, "msg": "" if ok else udisks_msg(msg)})
+    elif cmd == "open":
+        mp = mount(target(dev))
+        sub = argv[2] if len(argv) > 2 else ""
+        subprocess.Popen(["xdg-open", inside(mp, sub)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        out({"ok": True, "msg": ""})
+    elif cmd == "terminal":
+        mp = mount(target(dev))
+        sub = argv[2] if len(argv) > 2 else ""
+        subprocess.Popen(["kitty", "--directory", inside(mp, sub)], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        out({"ok": True, "msg": ""})
+    elif cmd == "ls":
+        mp = mount(target(dev))
+        out(listing(mp, argv[2] if len(argv) > 2 else ""))
+    elif cmd == "rename":
+        rename(dev, argv[2] if len(argv) > 2 else "")
+    elif cmd == "format":
+        fs = argv[2] if len(argv) > 2 else ""
+        label = argv[3] if len(argv) > 3 else ""
+        table = argv[4] if len(argv) > 4 else "gpt"
+        erase = argv[5] if len(argv) > 5 else "quick"
+        format_disk(dev, fs, label, table, erase)
+    else:
+        fail("unknown command")
+
+
+if __name__ == "__main__":
+    main()

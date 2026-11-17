@@ -1,0 +1,186 @@
+/* Shape of GTK 3/4 and libadwaita widgets: the shell radii (window.rounding scale) and the shell border. */
+
+/* Windows: same corner radius as the compositor rounding, so the two clips do not fight. */
+window.csd,
+window.csd decoration,
+window.background.csd {
+  border-radius: {{rm}}px;
+}
+headerbar, .titlebar {
+  border-top-left-radius: {{rm}}px;
+  border-top-right-radius: {{rm}}px;
+  border-bottom: 1px solid {{border}};
+}
+
+/* Buttons, fields, chips */
+button, .button, .pill-button {
+  border-radius: {{rs}}px;
+  border: 1px solid {{border}};
+  background-image: none;
+  box-shadow: none;
+}
+button.flat, button.image-button.flat, headerbar button {
+  border-color: transparent;
+}
+button.circular, button.circular-button, .circular {
+  border-radius: 9999px;
+}
+button.pill, button.suggested-action.pill, button.destructive-action.pill {
+  border-radius: 9999px;
+}
+button.suggested-action, button.destructive-action {
+  border-color: transparent;
+}
+button:hover:not(.suggested-action):not(.destructive-action):not(.flat) {
+  background-color: {{high}};
+}
+button:checked:not(.suggested-action):not(.destructive-action) {
+  background-color: {{high}};
+  border-color: {{accent}};
+}
+entry, spinbutton, .search entry, searchbar entry, text, passwordentry {
+  border-radius: {{rs}}px;
+}
+entry, spinbutton, passwordentry {
+  border: 1px solid {{border}};
+  box-shadow: none;
+  background-image: none;
+}
+entry:focus-within, spinbutton:focus-within, passwordentry:focus-within {
+  border-color: {{accent}};
+  outline-color: transparent;
+}
+dropdown > button, combobox button {
+  border-radius: {{rs}}px;
+}
+switch {
+  border-radius: 9999px;
+}
+switch slider {
+  border-radius: 9999px;
+}
+scale trough, scale highlight, scale slider, progressbar trough, progressbar progress, levelbar trough, levelbar block {
+  border-radius: 9999px;
+}
+scale highlight, progressbar progress {
+  background-color: {{accent}};
+}
+checkbutton check, radiobutton radio {
+  border-radius: {{ri}}px;
+}
+checkbutton radio, radiobutton radio {
+  border-radius: 9999px;
+}
+checkbutton check:checked, radiobutton radio:checked {
+  background-color: {{accent}};
+  color: {{accent_text}};
+}
+
+/* Popovers, menus, tooltips */
+popover > contents, popover.background > contents {
+  border-radius: {{rm}}px;
+  border: 1px solid {{border_soft}};
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+}
+popover.background, .menu, menu, .popup {
+  border-radius: {{rm}}px;
+}
+popover modelbutton, popover.menu modelbutton, menuitem, .menuitem {
+  border-radius: {{ri}}px;
+}
+modelbutton:hover, menuitem:hover {
+  background-color: {{high}};
+}
+tooltip, tooltip.background {
+  border-radius: {{rs}}px;
+  border: 1px solid {{border_soft}};
+}
+tooltip > box {
+  border-radius: {{rs}}px;
+}
+
+/* Cards, lists, sidebars */
+.card, .boxed-list, list.boxed-list {
+  border-radius: {{rm}}px;
+  border: 1px solid {{border}};
+  box-shadow: none;
+}
+list.boxed-list > row:first-child {
+  border-top-left-radius: {{rm}}px;
+  border-top-right-radius: {{rm}}px;
+}
+list.boxed-list > row:last-child {
+  border-bottom-left-radius: {{rm}}px;
+  border-bottom-right-radius: {{rm}}px;
+}
+listview > row, list > row, .navigation-sidebar > row, .navigation-sidebar row, gridview > child, columnview row {
+  border-radius: {{ri}}px;
+}
+list.boxed-list > row {
+  border-radius: 0;
+}
+listview > row:selected, list > row:selected, .navigation-sidebar row:selected, gridview > child:selected {
+  background-color: {{selection}};
+  color: {{text}};
+}
+.sidebar, .navigation-sidebar {
+  background-color: transparent;
+}
+frame, .frame {
+  border-radius: {{rs}}px;
+  border-color: {{border}};
+}
+scrolledwindow undershoot, scrolledwindow overshoot {
+  border-radius: {{rs}}px;
+}
+scrollbar slider {
+  border-radius: 9999px;
+  min-width: 6px;
+  min-height: 6px;
+  background-color: {{pill}};
+}
+scrollbar slider:hover {
+  background-color: {{mute}};
+}
+
+/* Tabs, toasts, dialogs, banners */
+tabbar tab, notebook > header > tabs > tab, tab {
+  border-radius: {{rs}}px;
+}
+tab:checked, notebook > header > tabs > tab:checked {
+  background-color: {{high}};
+  box-shadow: inset 0 -2px {{accent}};
+}
+toast, .toast, toolbar.osd, .osd {
+  border-radius: {{rl}}px;
+  border: 1px solid {{border_soft}};
+}
+banner > revealer > widget {
+  border-radius: {{rs}}px;
+}
+dialog-host > dialog.floating sheet, dialog.floating sheet, messagedialog.csd, messagedialog window.csd {
+  border-radius: {{rm}}px;
+}
+messagedialog .response-area > button, dialog .response-area > button {
+  border-radius: {{rs}}px;
+}
+.view, textview, iconview {
+  border-radius: {{ri}}px;
+}
+
+/* Nautilus */
+.nautilus-window .path-bar, .path-bar, pathbar {
+  border-radius: 9999px;
+}
+.path-bar button, pathbar button {
+  border-radius: 9999px;
+}
+.nautilus-window gridview > child, .nautilus-window listview > row {
+  border-radius: {{rs}}px;
+}
+.nautilus-window .floating-bar, .floating-bar {
+  border-radius: {{rm}}px;
+}
+.thumbnail, picture.thumbnail, .icon-dropshadow {
+  border-radius: {{ri}}px;
+}

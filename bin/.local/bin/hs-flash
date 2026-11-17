@@ -1,0 +1,1120 @@
+#!/usr/bin/env python3
+# Long drive jobs for the shell's Drives branch. Every job prints one JSON line per step on stdout:
+#   {"stage": "...", "label": "Writing", "done": B, "total": B, "speed": B/s}
+#   ... then {"stage": "done", "result": "..."} or {"stage": "error", "msg": "..."}
+# SIGTERM cancels a running job. Raw disk access goes through udisks (OpenForRestore / OpenForBackup), so polkit asks
+# for the password once (auth_admin_keep); only removable disks are ever touched.
+#
+#   hs-flash scan DIR                    # the image library (.iso/.img, also .img.xz/.img.zst/.img.gz)
+#   hs-flash sha FILE                    # SHA-256 with progress, checked against a checksum file next to it
+#   hs-flash write FILE /dev/sdX [verify|noverify]   # raw image (compressed ones are unpacked on the fly)
+#   hs-flash windows FILE /dev/sdX       # Windows installer: GPT + FAT32, files copied, install.wim split (7z, wimlib)
+#   hs-flash ventoy-get                  # download the latest Ventoy (TUNA mirror, GitHub as a fallback)
+#   hs-flash ventoy /dev/sdX install|upgrade         # Ventoy2Disk through pkexec
+#   hs-flash copy FILE /dev/sdX          # copy an image onto a Ventoy stick (its data partition)
+#   hs-flash backup /dev/sdX OUT         # whole disk into OUT (.img, or .img.zst compressed)
+#   hs-flash speed /dev/sdX              # write and read 256 MiB on the mounted filesystem, then remove it
+#   hs-flash probe /dev/sdX FS LABEL     # real capacity check (fake sticks), destructive, formats FS LABEL after
+#   hs-flash erase /dev/sdX FS LABEL     # overwrite every byte with random data, then format FS LABEL
+#   hs-flash import /dev/sdX DEST        # copy new photos and videos from DCIM into DEST/YYYY-MM-DD
+#   hs-flash catalog [refresh]           # the mirror's list of current images (cached 12 h), mapped to distro ids
+#   hs-flash download PATH DIR [VERSION] # one image from the mirror (resumes a .part, falls back to other mirrors,
+#                                        # checks the checksum the mirror publishes next to it)
+
+import datetime
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+CHUNK = 4 * 1024 * 1024
+SYNC_EVERY = 64 * 1024 * 1024
+CACHE = os.path.expanduser("~/.cache/hypr-shell/iso-scan.json")
+IMAGE_RE = re.compile(r"\.(iso|img|img\.xz|img\.zst|img\.gz)$", re.I)
+
+# Windows install media: its files do not boot when copied raw onto a stick, the shell warns about it.
+WIN_LABEL = re.compile(r"^(CCCOMA|CPBA|CCSA|CENA|CPRA|CRMA|CSSA|SSS|J_CCSA|IR\d_|IRM_|GRMC|GSP1|ESD-ISO|WIN)", re.I)
+
+
+def emit(obj):
+    print(json.dumps(obj), flush=True)
+
+
+def pvd(path):
+    """Label, application, creation date and flags read from the image header."""
+    info = {"label": "", "app": "", "created": "", "hybrid": False, "udf": False, "iso9660": False}
+    try:
+        with open(path, "rb") as f:
+            mbr = f.read(512)
+            info["hybrid"] = len(mbr) == 512 and mbr[510:512] == b"\x55\xaa"
+            f.seek(16 * 2048)
+            for _ in range(16):
+                sec = f.read(2048)
+                if len(sec) < 2048:
+                    break
+                ident = sec[1:6]
+                if ident == b"CD001" and sec[0] == 1 and not info["iso9660"]:
+                    info["iso9660"] = True
+                    info["label"] = sec[40:72].decode("ascii", "replace").strip()
+                    info["app"] = sec[574:702].decode("ascii", "replace").strip()
+                    d = sec[813:830].decode("ascii", "replace")
+                    if re.fullmatch(r"\d{16}.", d) and d[:4] != "0000":
+                        try:
+                            dt = datetime.datetime(int(d[0:4]), int(d[4:6]), int(d[6:8]), int(d[8:10]), int(d[10:12]))
+                            info["created"] = dt.strftime("%Y-%m-%d")
+                        except ValueError:
+                            pass
+                elif ident in (b"NSR02", b"NSR03"):
+                    info["udf"] = True
+                elif ident == b"CD001" and sec[0] == 255:
+                    break
+    except OSError:
+        pass
+    return info
+
+
+DATE_V = re.compile(r"(20\d\d)[.\-_]?(0[1-9]|1[0-2])[.\-_]?(0[1-9]|[12]\d|3[01])?")
+WIN_V = re.compile(r"win(?:dows)?[\s_-]?(1[01]|[78])(?:[\s_-]+(\d\dh\d))?", re.I)
+SHORT_DATE = re.compile(r"(?<!\d)(2\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)")
+NUM_V = re.compile(r"(?<![\dx])(\d{1,3}(?:\.\d{1,3}){0,3})(?:[-_ ]?(lts|beta|rc\d*|alpha))?(?![\d])", re.I)
+
+
+def version_guess(name, label):
+    """'archlinux-2026.11.01-x86_64.iso' -> '2026.11.01', 'ubuntu-24.04.1-desktop-amd64' -> '24.04.1'."""
+    stem = IMAGE_RE.sub("", name)
+    noise = re.compile(r"(x86[-_]64|amd64|aarch64|arm64|i[3-6]86|x64|64bit|32bit|\b(?:x|amd|arm)?64\b)", re.I)
+    for src in (stem, label):
+        s = noise.sub(" ", src)
+        m = WIN_V.search(s)
+        if m:
+            return m.group(1) + (" " + m.group(2).upper() if m.group(2) else "")
+        m = DATE_V.search(s)
+        if m and (m.group(3) or "." in m.group(0) or "-" in m.group(0)):
+            return ".".join(x for x in m.groups() if x)
+        m = NUM_V.search(s)
+        if m:
+            v = m.group(1)
+            if m.group(2):
+                v += " " + m.group(2).upper() if m.group(2).lower() == "lts" else "-" + m.group(2).lower()
+            return v
+    for src in (stem, label):
+        m = SHORT_DATE.search(src)
+        if m:
+            return "20%s.%s.%s" % m.groups()
+    return ""
+
+
+def scan(directory):
+    directory = os.path.expanduser(directory)
+    try:
+        cache = json.load(open(CACHE))
+    except (OSError, ValueError):
+        cache = {}
+    if not os.path.isdir(directory):
+        emit({"ok": False, "missing": True, "dir": directory, "items": []})
+        return
+    items, fresh = [], {}
+    for path in sorted(glob.glob(os.path.join(directory, "*"))):
+        if not IMAGE_RE.search(path) or not os.path.isfile(path):
+            continue
+        st = os.stat(path)
+        key = "%s|%d|%d" % (path, st.st_size, int(st.st_mtime))
+        comp = compression(path)
+        info = cache.get(key) or (pvd(path) if not comp else
+                                  {"label": "", "app": "", "created": "", "hybrid": True, "udf": False, "iso9660": False})
+        fresh[key] = info
+        name = os.path.basename(path)
+        items.append({
+            "path": path, "file": name, "size": st.st_size, "mtime": int(st.st_mtime),
+            "label": info["label"], "app": info["app"],
+            "created": info["created"] or datetime.date.fromtimestamp(st.st_mtime).isoformat(),
+            "dated": bool(info["created"]),
+            "version": version_guess(name, info["label"]),
+            "hybrid": info["hybrid"], "iso9660": info["iso9660"],
+            "windows": bool(WIN_LABEL.match(info["label"])) or (info["udf"] and not info["hybrid"]),
+            "compressed": comp,
+        })
+    try:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        json.dump(fresh, open(CACHE, "w"))
+    except OSError:
+        pass
+    emit({"ok": True, "dir": directory, "items": items})
+
+
+def sha(path):
+    total = os.path.getsize(path)
+    h = hashlib.sha256()
+    done, last = 0, 0
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(CHUNK)
+            if not b:
+                break
+            h.update(b)
+            done += len(b)
+            if time.monotonic() - last > 0.25:
+                last = time.monotonic()
+                emit({"stage": "sha", "done": done, "total": total})
+    digest = h.hexdigest()
+    name = os.path.basename(path)
+    expected, source = "", ""
+    d = os.path.dirname(path)
+    for cand in [path + ".sha256", path + ".sha256sum", os.path.splitext(path)[0] + ".sha256"] + \
+            sorted(glob.glob(os.path.join(d, "*SHA256*"))) + sorted(glob.glob(os.path.join(d, "*sha256*"))):
+        try:
+            text = open(cand, errors="replace").read(1 << 20)
+        except OSError:
+            continue
+        for line in text.splitlines():
+            m = re.search(r"\b([0-9a-fA-F]{64})\b", line)
+            if not m:
+                continue
+            if name in line or cand.startswith(path):
+                expected, source = m.group(1).lower(), os.path.basename(cand)
+                break
+            m2 = re.match(r"SHA256 \((.+)\) = ([0-9a-f]{64})", line)
+            if m2 and m2.group(1) == name:
+                expected, source = m2.group(2), os.path.basename(cand)
+                break
+        if expected:
+            break
+    emit({"stage": "done", "sha256": digest, "expected": expected, "source": source,
+          "match": (digest == expected) if expected else None})
+
+
+# ---- shared job plumbing ----
+
+STOP = {"flag": False}
+
+
+def on_term(*_):
+    STOP["flag"] = True
+
+
+signal.signal(signal.SIGTERM, on_term)
+signal.signal(signal.SIGINT, on_term)
+
+
+class Fail(Exception):
+    pass
+
+
+class Progress:
+    """Throttled progress lines with a running speed for one stage."""
+
+    def __init__(self, stage, label, total, base=0):
+        # `base`: bytes already there before this run (a resumed download); the speed counts only this run.
+        self.stage, self.label, self.total, self.base = stage, label, total, base
+        self.t0, self.last = time.monotonic(), 0.0
+        emit({"stage": stage, "label": label, "done": 0, "total": total, "speed": 0})
+
+    def __call__(self, done, force=False):
+        now = time.monotonic()
+        if force or now - self.last > 0.3:
+            self.last = now
+            emit({"stage": self.stage, "label": self.label, "done": done, "total": self.total,
+                  "speed": (done - self.base) / max(now - self.t0, 0.001)})
+
+
+def step(stage, label):
+    """A stage without a measurable amount of work (the bar shows as busy)."""
+    emit({"stage": stage, "label": label, "done": 0, "total": 0, "speed": 0})
+
+
+def compression(path):
+    low = path.lower()
+    for ext, tool in ((".xz", "xz"), (".zst", "zstd"), (".gz", "gzip")):
+        if low.endswith(ext):
+            return tool
+    return ""
+
+
+def lsblk(dev):
+    r = subprocess.run(["lsblk", "-b", "-J", "-o",
+                        "PATH,TYPE,RM,HOTPLUG,TRAN,SIZE,MOUNTPOINTS,LABEL,FSTYPE,FSAVAIL", dev],
+                       capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout)["blockdevices"][0]
+    except (ValueError, KeyError, IndexError):
+        return None
+
+
+SYSTEM = ("/", "/boot", "/efi", "/home", "/usr", "/var")
+
+
+def removable_disk(dev):
+    d = lsblk(dev)
+    if d is None or d.get("type") != "disk":
+        raise Fail("not a disk")
+    if not (d.get("rm") or d.get("hotplug") or d.get("tran") in ("usb", "mmc")):
+        raise Fail("only removable drives are handled here")
+    for c in [d] + d.get("children", []):
+        if any(m in SYSTEM for m in (c.get("mountpoints") or []) if m):
+            raise Fail("the drive holds a system mount")
+    return d
+
+
+def unmount_all(d):
+    for c in [d] + d.get("children", []):
+        if any(m for m in (c.get("mountpoints") or []) if m):
+            r = subprocess.run(["udisksctl", "unmount", "-b", c["path"], "--no-user-interaction"],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise Fail("cannot unmount " + c["path"])
+
+
+def settle():
+    subprocess.run(["udevadm", "settle", "-t", "5"], capture_output=True)
+
+
+def open_udisks(dev, method):
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+    name = dev.removeprefix("/dev/")
+    if not re.fullmatch(r"[A-Za-z0-9]+", name):
+        raise Fail("bad device")
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    try:
+        ret, fds = bus.call_with_unix_fd_list_sync(
+            "org.freedesktop.UDisks2", "/org/freedesktop/UDisks2/block_devices/" + name,
+            "org.freedesktop.UDisks2.Block", method, GLib.Variant("(a{sv})", ({},)), GLib.VariantType("(h)"),
+            Gio.DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, 0x7fffffff, None, None)
+    except GLib.Error as ex:
+        if "NotAuthorized" in ex.message or "dismissed" in ex.message.lower():
+            raise Fail("Not authorized")
+        raise Fail(re.sub(r"^.*GDBus\.Error:[\w.]+:\s*", "", ex.message))
+    return fds.get(ret.unpack()[0])
+
+
+def mount_main(dev):
+    """Mounts the biggest filesystem partition of a disk and returns its mount point."""
+    d = lsblk(dev)
+    parts = [c for c in d.get("children", []) if c.get("fstype")] or ([d] if d.get("fstype") else [])
+    if not parts:
+        raise Fail("no filesystem on the drive")
+    p = max(parts, key=lambda c: c.get("size") or 0)
+    mps = [m for m in (p.get("mountpoints") or []) if m]
+    if mps:
+        return mps[0], p["path"]
+    r = subprocess.run(["udisksctl", "mount", "-b", p["path"], "--no-user-interaction"], capture_output=True, text=True)
+    m = re.search(r" at (.+?)\.?$", r.stdout.strip())
+    if r.returncode != 0 or not m:
+        raise Fail("cannot mount " + p["path"])
+    return m.group(1), p["path"]
+
+
+def hs_drives(*args):
+    r = subprocess.run(["hs-drives"] + list(args), capture_output=True, text=True)
+    try:
+        res = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        res = {"ok": False, "msg": "hs-drives failed"}
+    if not res.get("ok"):
+        raise Fail(res.get("msg") or "hs-drives failed")
+
+
+def reformat(dev, fs, label):
+    step("format", "Formatting as " + fs)
+    settle()
+    hs_drives("format", dev, fs, label, "dos", "quick")
+
+
+def copy_fd(src, fd, prog, hasher=None, limit=None):
+    """Copies a readable file object onto fd. Returns the number of bytes written."""
+    done, since = 0, 0
+    while not STOP["flag"]:
+        n = CHUNK if limit is None else min(CHUNK, limit - done)
+        if n <= 0:
+            break
+        b = src.read(n)
+        if not b:
+            break
+        view = memoryview(b)
+        while view:
+            w = os.write(fd, view)
+            view = view[w:]
+        if hasher:
+            hasher.update(b)
+        done += len(b)
+        since += len(b)
+        if since >= SYNC_EVERY:
+            os.fsync(fd)
+            since = 0
+        prog(done)
+    return done
+
+
+def readback(dev, length, digest, label="Verifying"):
+    rfd = open_udisks(dev, "OpenForBackup")
+    try:
+        try:
+            os.posix_fadvise(rfd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
+        prog = Progress("verify", label, length)
+        h, got = hashlib.sha256(), 0
+        while got < length and not STOP["flag"]:
+            b = os.read(rfd, min(CHUNK, length - got))
+            if not b:
+                break
+            h.update(b)
+            got += len(b)
+            prog(got)
+    finally:
+        os.close(rfd)
+    if STOP["flag"]:
+        return None
+    return got == length and h.digest() == digest
+
+
+# ---- raw image ----
+
+def write(path, dev, verify):
+    total = os.path.getsize(path)
+    d = removable_disk(dev)
+    comp = compression(path)
+    if not comp and total > (d.get("size") or 0):
+        raise Fail("the image is larger than the drive")
+    unmount_all(d)
+    step("auth", "Waiting for password")
+    fd = open_udisks(dev, "OpenForRestore")
+    hasher = hashlib.sha256() if verify else None
+    try:
+        if comp:
+            src_file = open(path, "rb")
+            proc = subprocess.Popen([comp, "-dc"], stdin=src_file, stdout=subprocess.PIPE)
+            base = Progress("write", "Unpacking and writing", total)
+
+            def prog(_):
+                # Progress follows how far the decompressor has read the packed file.
+                try:
+                    pos = int(re.search(r"pos:\s*(\d+)", open("/proc/%d/fdinfo/0" % proc.pid).read()).group(1))
+                    base(pos)
+                except (OSError, AttributeError, ValueError):
+                    pass
+            written = copy_fd(proc.stdout, fd, prog, hasher)
+            proc.stdout.close()
+            if STOP["flag"]:
+                proc.kill()
+            elif proc.wait() != 0:
+                raise Fail("the packed image is damaged")
+            src_file.close()
+        else:
+            with open(path, "rb") as src:
+                written = copy_fd(src, fd, Progress("write", "Writing", total), hasher)
+        step("sync", "Finishing")
+        os.fsync(fd)
+    except OSError as ex:
+        raise Fail(ex.strerror or "write failed")
+    finally:
+        os.close(fd)
+    if STOP["flag"]:
+        raise Fail("Cancelled, the drive needs formatting now")
+    verified = False
+    if verify:
+        ok = readback(dev, written, hasher.digest())
+        if ok is False:
+            raise Fail("Verification failed: the drive does not match the image")
+        verified = ok is True
+    settle()
+    emit({"stage": "done", "verified": verified,
+          "result": os.path.basename(path) + (" written and verified" if verified else " written")})
+
+
+# ---- Windows installer ----
+
+FAT_MAX = 4 * 1024 ** 3 - 1
+
+
+def seven_list(iso):
+    r = subprocess.run(["7z", "l", "-slt", "-ba", iso], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Fail("7z cannot read the image")
+    files, cur = {}, {}
+    for line in r.stdout.splitlines() + [""]:
+        if not line.strip():
+            if cur.get("Path") and cur.get("Folder") != "+":
+                files[cur["Path"]] = int(cur.get("Size") or 0)
+            cur = {}
+            continue
+        k, _, v = line.partition(" = ")
+        cur[k] = v
+    return files
+
+
+def seven_extract(args, total, base_done, prog):
+    """Runs 7z with -bsp1 and turns its percentage into bytes for the job progress."""
+    proc = subprocess.Popen(["7z"] + args + ["-y", "-bsp1", "-bso0", "-bse1"], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT)
+    buf = b""
+    while True:
+        ch = proc.stdout.read(64)
+        if not ch:
+            break
+        if STOP["flag"]:
+            proc.kill()
+            break
+        buf = (buf + ch)[-256:]
+        m = re.findall(rb"(\d{1,3})%", buf)
+        if m:
+            prog(base_done + total * int(m[-1]) // 100)
+    if proc.wait() != 0 and not STOP["flag"]:
+        raise Fail("7z could not extract the image")
+
+
+def windows(iso, dev):
+    for tool, pkg in (("7z", "7zip"), ("wimlib-imagex", "wimlib"), ("mkfs.vfat", "dosfstools")):
+        if not shutil.which(tool):
+            raise Fail("needs " + pkg + " (pacman -S " + pkg + ")")
+    d = removable_disk(dev)
+    step("prepare", "Reading the image")
+    files = seven_list(iso)
+    wim = next((p for p in files if p.lower() == "sources/install.wim"), None)
+    total = sum(files.values())
+    if total > (d.get("size") or 0):
+        raise Fail("the drive is too small for this image")
+    big = wim is not None and files[wim] > FAT_MAX
+    unmount_all(d)
+    step("format", "Formatting as FAT32")
+    hs_drives("format", dev, "vfat", "WINDOWS", "gpt", "quick")
+    settle()
+    mp, _ = mount_main(dev)
+    prog = Progress("copy", "Copying files", total)
+    rest = total - (files[wim] if big else 0)
+    seven_extract(["x", iso, "-o" + mp] + (["-x!" + wim] if big else []), rest, 0, prog)
+    if big and not STOP["flag"]:
+        tmp = os.path.expanduser("~/.cache/hypr-shell/win-tmp")
+        os.makedirs(tmp, exist_ok=True)
+        try:
+            if shutil.disk_usage(tmp).free < files[wim] + (512 << 20):
+                raise Fail("not enough free space in ~/.cache for install.wim")
+            seven_extract(["e", iso, "-o" + tmp, wim], files[wim] // 2, rest, prog)
+            if not STOP["flag"]:
+                step("split", "Splitting install.wim for FAT32")
+                os.makedirs(os.path.join(mp, "sources"), exist_ok=True)
+                r = subprocess.run(["wimlib-imagex", "split", os.path.join(tmp, "install.wim"),
+                                    os.path.join(mp, "sources", "install.swm"), "3800"], capture_output=True, text=True)
+                if r.returncode != 0:
+                    raise Fail("wimlib could not split install.wim")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if STOP["flag"]:
+        raise Fail("Cancelled, the drive is incomplete")
+    step("sync", "Finishing")
+    subprocess.run(["sync", "-f", mp])
+    emit({"stage": "done", "result": "Windows installer ready"})
+
+
+# ---- Ventoy ----
+
+VENTOY_DIR = os.path.expanduser("~/.local/share/hypr-shell/ventoy")
+UA = {"User-Agent": "hypr-shell"}
+
+
+def http_json(url):
+    import urllib.request
+    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=20) as r:
+        return json.load(r)
+
+
+def ventoy_tool():
+    for p in sorted(glob.glob(os.path.join(VENTOY_DIR, "ventoy-*", "Ventoy2Disk.sh")), reverse=True):
+        return os.path.dirname(p)
+    return ""
+
+
+def ventoy_get():
+    import tarfile
+    import urllib.request
+    url = ""
+    try:
+        for e in http_json("https://mirrors.tuna.tsinghua.edu.cn/static/status/isoinfo.json"):
+            if e.get("distro") == "Ventoy":
+                for u in e.get("urls", []):
+                    if u["url"].endswith("-linux.tar.gz"):
+                        url = "https://mirrors.tuna.tsinghua.edu.cn" + u["url"]
+                        break
+    except Exception:
+        pass
+    if not url:
+        try:
+            rel = http_json("https://api.github.com/repos/ventoy/Ventoy/releases/latest")
+            url = next(a["browser_download_url"] for a in rel["assets"] if a["name"].endswith("-linux.tar.gz"))
+        except Exception:
+            raise Fail("cannot find a Ventoy download")
+    os.makedirs(VENTOY_DIR, exist_ok=True)
+    out = os.path.join(VENTOY_DIR, os.path.basename(url))
+    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30) as r, open(out + ".part", "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        prog, done = Progress("download", "Downloading Ventoy", total), 0
+        while not STOP["flag"]:
+            b = r.read(1 << 20)
+            if not b:
+                break
+            f.write(b)
+            done += len(b)
+            prog(done)
+    if STOP["flag"]:
+        os.remove(out + ".part")
+        raise Fail("Cancelled")
+    os.replace(out + ".part", out)
+    step("unpack", "Unpacking")
+    with tarfile.open(out) as t:
+        t.extractall(VENTOY_DIR, filter="data")
+    os.remove(out)
+    return os.path.basename(ventoy_tool()).removeprefix("ventoy-")
+
+
+def ventoy(dev, mode):
+    d = removable_disk(dev)
+    tool = ventoy_tool()
+    if not tool:
+        ventoy_get()
+        tool = ventoy_tool()
+    unmount_all(d)
+    step("auth", "Installing Ventoy" if mode == "install" else "Updating Ventoy")
+    flag = "-I" if mode == "install" else "-u"
+    args = [flag, "-g", dev] if mode == "install" else [flag, dev]
+    r = subprocess.run(["pkexec", "sh", "-c", 'cd "$1" && shift && exec ./Ventoy2Disk.sh "$@"', "sh", tool] + args,
+                       input="y\ny\n", capture_output=True, text=True)
+    if r.returncode != 0:
+        tail = [l for l in (r.stdout + r.stderr).splitlines() if l.strip()]
+        raise Fail("Not authorized" if r.returncode in (126, 127) else (tail[-1] if tail else "Ventoy failed"))
+    settle()
+    ver = os.path.basename(tool).removeprefix("ventoy-")
+    emit({"stage": "done", "result": "Ventoy " + ver + (" installed" if mode == "install" else " updated")})
+
+
+def copy(path, dev):
+    removable_disk(dev)
+    mp, _ = mount_main(dev)
+    size = os.path.getsize(path)
+    dest = os.path.join(mp, os.path.basename(path))
+    if os.path.exists(dest) and os.path.getsize(dest) == size:
+        emit({"stage": "done", "result": "Already on the drive"})
+        return
+    if shutil.disk_usage(mp).free < size:
+        raise Fail("not enough free space on the drive")
+    with open(path, "rb") as src, open(dest + ".part", "wb") as f:
+        copy_fd(src, f.fileno(), Progress("copy", "Copying", size))
+        step("sync", "Finishing")
+        os.fsync(f.fileno())
+    if STOP["flag"]:
+        os.remove(dest + ".part")
+        raise Fail("Cancelled")
+    os.replace(dest + ".part", dest)
+    emit({"stage": "done", "result": os.path.basename(path) + " is on the drive"})
+
+
+# ---- backup ----
+
+def backup(dev, out):
+    d = removable_disk(dev)
+    total = d.get("size") or 0
+    zst = out.endswith(".zst")
+    if zst and not shutil.which("zstd"):
+        raise Fail("zstd is not installed")
+    if not zst and shutil.disk_usage(os.path.dirname(out) or ".").free < total:
+        raise Fail("not enough free space for the image")
+    step("auth", "Waiting for password")
+    fd = open_udisks(dev, "OpenForBackup")
+    part = out + ".part"
+    try:
+        sink = open(part, "wb")
+        proc = None
+        if zst:
+            proc = subprocess.Popen(["zstd", "-T0", "-3", "-q", "-f", "-o", part, "-"], stdin=subprocess.PIPE)
+            sink.close()
+            sink = proc.stdin
+        prog, done = Progress("backup", "Reading the drive", total), 0
+        while done < total and not STOP["flag"]:
+            b = os.read(fd, min(CHUNK, total - done))
+            if not b:
+                break
+            sink.write(b)
+            done += len(b)
+            prog(done)
+        sink.close()
+        if proc and proc.wait() != 0:
+            raise Fail("zstd failed")
+    finally:
+        os.close(fd)
+    if STOP["flag"]:
+        os.remove(part)
+        raise Fail("Cancelled")
+    os.replace(part, out)
+    emit({"stage": "done", "result": "Saved " + os.path.basename(out) + " (" + human(os.path.getsize(out)) + ")",
+          "path": out})
+
+
+def human(n):
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1000 or u == "TB":
+            return ("%.1f %s" % (n, u)) if u != "B" else "%d B" % n
+        n /= 1000
+
+
+# ---- tests ----
+
+def speed(dev):
+    removable_disk(dev)
+    mp, _ = mount_main(dev)
+    size = 256 * 1024 * 1024
+    if shutil.disk_usage(mp).free < size + (32 << 20):
+        raise Fail("needs 300 MB free on the drive")
+    path = os.path.join(mp, ".hs-speedtest")
+    block = os.urandom(CHUNK)
+    try:
+        prog = Progress("write", "Write test", size)
+        t0 = time.monotonic()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        done, since = 0, 0
+        while done < size and not STOP["flag"]:
+            os.write(fd, block)
+            done += CHUNK
+            since += CHUNK
+            if since >= SYNC_EVERY:
+                os.fsync(fd)
+                since = 0
+            prog(done)
+        os.fsync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        os.close(fd)
+        wspeed = size / (time.monotonic() - t0)
+        if STOP["flag"]:
+            raise Fail("Cancelled")
+        prog = Progress("read", "Read test", size)
+        t0 = time.monotonic()
+        fd = os.open(path, os.O_RDONLY)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        done = 0
+        while not STOP["flag"]:
+            b = os.read(fd, CHUNK)
+            if not b:
+                break
+            done += len(b)
+            prog(done)
+        os.close(fd)
+        rspeed = size / (time.monotonic() - t0)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if STOP["flag"]:
+        raise Fail("Cancelled")
+    emit({"stage": "done", "result": "Write %s/s · Read %s/s" % (human(wspeed), human(rspeed)),
+          "write": wspeed, "read": rspeed})
+
+
+MAGIC = b"HSPROBE1"
+BLOCK = 1024 * 1024
+
+
+def probe(dev, fs, label):
+    """Fake sticks report more space than they have and wrap or drop writes past the real end. Writes a tagged 1 MiB
+    block at 256 spots across the whole claimed size, flushes, drops the cache and reads them back."""
+    d = removable_disk(dev)
+    size = d.get("size") or 0
+    count = 256
+    offsets = sorted({(i * (size - BLOCK) // (count - 1)) // BLOCK * BLOCK for i in range(count)})
+    nonce = os.urandom(16)
+    filler = os.urandom(BLOCK)
+    unmount_all(d)
+    step("auth", "Waiting for password")
+    fd = open_udisks(dev, "OpenForRestore")
+
+    def block(off):
+        head = MAGIC + nonce + off.to_bytes(8, "little")
+        return head + filler[len(head):]
+    try:
+        prog = Progress("write", "Writing test blocks", len(offsets) * BLOCK)
+        for i, off in enumerate(offsets):
+            if STOP["flag"]:
+                break
+            os.pwrite(fd, block(off), off)
+            if i % 32 == 31:
+                os.fsync(fd)
+            prog((i + 1) * BLOCK)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if STOP["flag"]:
+        raise Fail("Cancelled, the drive needs formatting now")
+    # Each spot is read back and its tag noted. No tag: the data was lost there. Several spots showing the same tag
+    # are one physical place under several addresses, so every address but the lowest is past the real end. A spot
+    # showing another spot's tag alone: the higher of the two addresses is past the end. The real size ends at the
+    # lowest such address.
+    rfd = open_udisks(dev, "OpenForBackup")
+    seen, bad = {}, []
+    try:
+        os.posix_fadvise(rfd, 0, 0, os.POSIX_FADV_DONTNEED)
+        prog = Progress("read", "Reading them back", len(offsets) * BLOCK)
+        tag = len(MAGIC) + len(nonce)
+        for i, off in enumerate(offsets):
+            if STOP["flag"]:
+                break
+            got = os.pread(rfd, BLOCK, off)
+            if got[:tag] == MAGIC + nonce and got[tag + 8:] == filler[tag + 8:]:
+                seen.setdefault(int.from_bytes(got[tag:tag + 8], "little"), []).append(off)
+            else:
+                bad.append(off)
+            prog((i + 1) * BLOCK)
+    finally:
+        os.close(rfd)
+    if STOP["flag"]:
+        raise Fail("Cancelled, the drive needs formatting now")
+    for t, where in seen.items():
+        where.sort()
+        if len(where) > 1:
+            bad.append(where[1])
+        elif where[0] != t:
+            bad.append(max(where[0], t))
+    real = min(bad) if bad else size
+    reformat(dev, fs, label)
+    if not bad:
+        emit({"stage": "done", "ok": True, "result": "Genuine: all " + human(size) + " hold data"})
+    else:
+        emit({"stage": "done", "ok": False, "real": real,
+              "result": "Fake: only about " + human(real) + " of " + human(size) + " is real"})
+
+
+def erase(dev, fs, label):
+    d = removable_disk(dev)
+    total = d.get("size") or 0
+    unmount_all(d)
+    step("auth", "Waiting for password")
+    fd = open_udisks(dev, "OpenForRestore")
+    try:
+        prog, done, since = Progress("erase", "Overwriting with random data", total), 0, 0
+        block = os.urandom(CHUNK)
+        while done < total and not STOP["flag"]:
+            n = min(CHUNK, total - done)
+            # A fresh random block every 64 MiB keeps it cheap while no two regions repeat for long.
+            if since == 0:
+                block = os.urandom(CHUNK)
+            os.write(fd, block[:n])
+            done += n
+            since += n
+            if since >= SYNC_EVERY:
+                os.fsync(fd)
+                since = 0
+            prog(done)
+        step("sync", "Finishing")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if STOP["flag"]:
+        raise Fail("Cancelled, the drive is partly erased and needs formatting")
+    reformat(dev, fs, label)
+    emit({"stage": "done", "result": "Erased and formatted"})
+
+
+MEDIA = re.compile(r"\.(jpe?g|png|heic|heif|dng|raw|arw|cr2|cr3|nef|orf|rw2|raf|mp4|mov|m4v|avi|mts|3gp)$", re.I)
+
+
+def camera_files(mp):
+    out = []
+    for root, _, names in os.walk(os.path.join(mp, "DCIM")):
+        for n in names:
+            if MEDIA.search(n):
+                p = os.path.join(root, n)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                out.append((p, st.st_size, st.st_mtime))
+    return out
+
+
+def import_photos(dev, dest):
+    removable_disk(dev)
+    mp, _ = mount_main(dev)
+    files = camera_files(mp)
+    if not files:
+        raise Fail("no photos in DCIM")
+    dest = os.path.expanduser(dest)
+    todo = []
+    for p, size, mtime in files:
+        day = datetime.date.fromtimestamp(mtime).isoformat()
+        target = os.path.join(dest, day, os.path.basename(p))
+        if os.path.exists(target) and os.path.getsize(target) == size:
+            continue
+        todo.append((p, size, mtime, target))
+    total = sum(t[1] for t in todo)
+    prog, done = Progress("copy", "Importing photos", total), 0
+    for p, size, mtime, target in todo:
+        if STOP["flag"]:
+            break
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(p, "rb") as src, open(target + ".part", "wb") as f:
+            while not STOP["flag"]:
+                b = src.read(CHUNK)
+                if not b:
+                    break
+                f.write(b)
+                done += len(b)
+                prog(done)
+        if STOP["flag"]:
+            os.remove(target + ".part")
+            break
+        os.replace(target + ".part", target)
+        os.utime(target, (mtime, mtime))
+    if STOP["flag"]:
+        raise Fail("Cancelled")
+    skipped = len(files) - len(todo)
+    emit({"stage": "done", "path": dest,
+          "result": "Imported %d file%s" % (len(todo), "" if len(todo) == 1 else "s")
+          + (" · %d already there" % skipped if skipped else "")})
+
+
+# ---- mirror catalog and downloads ----
+
+# Chinese university mirrors run the same mirror-web software: the same paths everywhere and an isoinfo.json that the
+# mirror regenerates itself whenever a distribution releases, so no download link is ever hardcoded here.
+MIRRORS = ["https://mirrors.tuna.tsinghua.edu.cn", "https://mirrors.bfsu.edu.cn", "https://mirrors.nju.edu.cn",
+           "https://mirrors.ustc.edu.cn"]
+CATALOG = os.path.expanduser("~/.cache/hypr-shell/isoinfo.json")
+CATALOG_TTL = 12 * 3600
+
+# Mirror distro name -> the shell's distribution id (data/distros.js); derivatives are told apart by the entry name.
+DISTRO_IDS = {"Ubuntu": "ubuntu", "Debian": "debian", "Arch Linux": "arch", "Fedora": "fedora", "openSUSE": "opensuse",
+              "CentOS": "centos", "BlackArch": "blackarch", "Proxmox": "proxmox", "Kali": "kali", "Artix Linux": "artix",
+              "Ubuntu Core": "ubuntu", "Linux Mint": "mint", "KaOS": "kaos", "EndeavourOS": "endeavouros",
+              "NixOS": "nixos", "优麒麟": "ubuntu", "Solus": "solus", "Anthon": "aosc", "Qubes OS": "qubes",
+              "NetBSD": "netbsd", "Alpine": "alpine", "Rocky Linux": "rocky", "AlmaLinux": "alma", "Manjaro": "manjaro",
+              "Deepin": "deepin", "openEuler": "linux", "Gentoo": "gentoo"}
+DERIVATIVES = [("xubuntu", "xubuntu"), ("lubuntu", "lubuntu"), ("kubuntu", "kubuntu"), ("ubuntu mate", "ubuntumate"),
+               ("ubuntu budgie", "ubuntu"), ("ubuntu kylin", "ubuntu"), ("ubuntu gnome", "ubuntu"),
+               ("ubuntu studio", "ubuntu"), ("ubuntu unity", "ubuntu"), ("edubuntu", "ubuntu")]
+NOT_X86 = re.compile(r"\b(powerpc\w*|ia64|itanium|arm\w*|aarch64|i[3-6]86|x86(?!_64)|ppc\w*|s390x?|riscv\w*|loong\w*|mips\w*|sparc\w*|alpha|vax|"
+                     r"hppa|m68k|\w+68k|sun\d|zaurus|evb\w+|amiga|atari|cobalt|hp300|luna|macppc|pmax|sgimips|landisk|"
+                     r"emips|ews4800mips|ibmnws|mvme\w*|bebox|cats|epoc32|hpcarm|hpcmips|hpcsh|iyonix|netwinder|"
+                     r"ofppc|prep|rs6000|sandpoint|shark|sbmips|acorn32|algor|arc|dreamcast|mmeye|mvmeppc|news\w*|"
+                     r"next\w*|playstation\w*|pmppc|rpi|raspi|virt64)\b", re.I)
+
+
+def track_of(label, path):
+    t = (label + " " + path).lower()
+    for key, word in (("lmde", "lmde"), ("core", "ubuntu-core"), ("kylin", "kylin"), ("gnome", "ubuntu-gnome"),
+                      ("mail", "mail-gateway"), ("backup", "backup-server"), ("leap", "leap"), ("netinst", "")):
+        if word and word in t:
+            return key
+    return ""
+
+
+def catalog_entries(raw, host):
+    out = []
+    for e in raw:
+        if e.get("category") != "os" or e.get("distro") not in DISTRO_IDS:
+            continue
+        for u in e.get("urls", []):
+            label, path = u.get("name", ""), u.get("url", "")
+            file = path.rsplit("/", 1)[-1]
+            if not IMAGE_RE.search(file) or NOT_X86.search(label + " " + file):
+                continue
+            did = DISTRO_IDS[e["distro"]]
+            low = label.lower()
+            for word, sub in DERIVATIVES:
+                if low.startswith(word):
+                    did = sub
+            head = label.split(" (")[0]
+            version = version_guess(head, "") or version_guess(file, "")
+            out.append({"distro": e["distro"], "id": did, "track": track_of(label, path), "label": label,
+                        "version": version, "pre": bool(re.search(r"(?<![a-z])(rc\d*|beta\d*|alpha\d*|preview|daily)(?![a-z])", version + " " + low)),
+                        "lts": bool(re.match(r"\d*[02468]\.04", version)) and did.endswith(("ubuntu", "mate")),
+                        "file": file, "path": path})
+    return out
+
+
+def catalog(force):
+    try:
+        fresh = not force and time.time() - os.path.getmtime(CATALOG) < CATALOG_TTL
+    except OSError:
+        fresh = False
+    raw, host, err = None, "", ""
+    if not fresh:
+        for m in MIRRORS:
+            try:
+                raw = http_json(m + "/static/status/isoinfo.json")
+                host = m
+                break
+            except Exception as ex:
+                err = str(ex)
+        if raw is not None:
+            os.makedirs(os.path.dirname(CATALOG), exist_ok=True)
+            with open(CATALOG + ".part", "w") as f:
+                json.dump({"host": host, "fetched": int(time.time()), "raw": raw}, f)
+            os.replace(CATALOG + ".part", CATALOG)
+    try:
+        cached = json.load(open(CATALOG))
+    except (OSError, ValueError):
+        emit({"ok": False, "msg": "Mirror unreachable" + (": " + err if err else ""), "entries": []})
+        return
+    emit({"ok": True, "fetched": cached["fetched"], "host": cached["host"], "stale": raw is None and not fresh,
+          "entries": catalog_entries(cached["raw"], cached["host"])})
+
+
+def checksum_for(host, path, name):
+    """Looks for the image's checksum in the mirror folder: the folder index is read and every file that looks like
+    a checksum list (SHA256SUMS, *CHECKSUM, name.sha256, sha256sum.txt, name.sha512sum…) is searched for the name."""
+    import urllib.request
+    folder = path.rsplit("/", 1)[0] + "/"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(host + folder, headers=UA), timeout=20) as r:
+            index = r.read(2 << 20).decode("utf-8", "replace")
+    except Exception:
+        return "", ""
+    links = []
+    for href in re.findall(r'href="([^"?#]+)"', index):
+        h = href.rsplit("/", 1)[-1]
+        if re.search(r"sha(256|512)|checksum|digests", h, re.I) and not h.endswith((".sig", ".asc", ".gpg")):
+            if not re.search(r"\.(iso|img)\.", h, re.I) or h.startswith(name):
+                links.append(h)
+    links.sort(key=lambda h: (not h.startswith(name), len(h)))
+    for h in links[:8]:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(host + folder + h, headers=UA), timeout=20) as r:
+                text = r.read(1 << 20).decode("utf-8", "replace")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            m = re.search(r"\b([0-9a-fA-F]{128}|[0-9a-fA-F]{64})\b", line)
+            if m and (name in line or (h.startswith(name) and len(text.split()) <= 3)):
+                return m.group(1).lower(), h
+    return "", ""
+
+
+def download(path, directory, version):
+    import urllib.error
+    import urllib.request
+    if not path.startswith("/") or ".." in path:
+        raise Fail("bad path")
+    name = path.rsplit("/", 1)[-1]
+    target = name
+    # Files named "latest-…" or "…-Current" carry no version; put it in the name so releases do not overwrite each other.
+    if version and version not in name:
+        m = IMAGE_RE.search(name)
+        target = name[:m.start()] + "-" + version.replace(" ", "-") + name[m.start():]
+    directory = os.path.expanduser(directory)
+    os.makedirs(directory, exist_ok=True)
+    dest = os.path.join(directory, target)
+    part = dest + ".part"
+    if os.path.exists(dest):
+        emit({"stage": "done", "result": target + " is already in the library", "path": dest})
+        return
+    h256, h512 = hashlib.sha256(), hashlib.sha512()
+    have = os.path.getsize(part) if os.path.exists(part) else 0
+    if have:
+        step("prepare", "Resuming")
+        with open(part, "rb") as f:
+            while True:
+                b = f.read(CHUNK)
+                if not b:
+                    break
+                h256.update(b)
+                h512.update(b)
+    host, last_err = "", ""
+    for m in MIRRORS:
+        req = urllib.request.Request(m + path, headers=dict(UA, **({"Range": "bytes=%d-" % have} if have else {})))
+        try:
+            resp = urllib.request.urlopen(req, timeout=30)
+        except urllib.error.HTTPError as ex:
+            if ex.code == 416:  # the part is already complete
+                resp, host = None, m
+                break
+            last_err = "HTTP %d" % ex.code
+            continue
+        except Exception as ex:
+            last_err = str(getattr(ex, "reason", ex))
+            continue
+        host = m
+        break
+    else:
+        raise Fail("no mirror has it (" + last_err + ")")
+    if resp is not None:
+        if have and resp.status != 206:  # the mirror ignored the range: start over
+            have = 0
+            h256, h512 = hashlib.sha256(), hashlib.sha512()
+        total = have + int(resp.headers.get("Content-Length") or 0)
+        prog = Progress("download", "Downloading from " + host.split("//")[1].split(".")[1].upper(), total, have)
+        done = have
+        with resp, open(part, "ab" if have else "wb") as f:
+            while not STOP["flag"]:
+                b = resp.read(1 << 20)
+                if not b:
+                    break
+                f.write(b)
+                h256.update(b)
+                h512.update(b)
+                done += len(b)
+                prog(done)
+        if STOP["flag"]:
+            raise Fail("Paused, the download continues from here next time")
+        if total and done < total:
+            raise Fail("The connection dropped, try again to continue")
+    step("verify", "Checking the checksum")
+    expected, source = checksum_for(host, path, name)
+    if expected:
+        got = h256.hexdigest() if len(expected) == 64 else h512.hexdigest()
+        if got != expected:
+            os.remove(part)
+            raise Fail("Checksum mismatch, the download was damaged and is removed")
+    os.replace(part, dest)
+    emit({"stage": "done", "path": dest, "verified": bool(expected),
+          "result": target + (" · checksum OK" if expected else " · no checksum on the mirror")})
+
+
+def main():
+    a = sys.argv[1:]
+    cmd = a[0] if a else ""
+    need = {"scan": 2, "sha": 2, "write": 3, "windows": 3, "ventoy-get": 1, "ventoy": 3, "copy": 3, "backup": 3,
+            "speed": 2, "probe": 4, "erase": 4, "import": 3, "catalog": 1, "download": 3}
+    if cmd not in need or len(a) < need[cmd]:
+        emit({"stage": "error", "msg": "usage: see the header of hs-flash"})
+        return
+    try:
+        if cmd == "scan":
+            scan(a[1])
+        elif cmd == "sha":
+            sha(a[1])
+        elif cmd == "write":
+            write(a[1], a[2], (a[3] if len(a) > 3 else "verify") == "verify")
+        elif cmd == "windows":
+            windows(a[1], a[2])
+        elif cmd == "ventoy-get":
+            emit({"stage": "done", "result": "Ventoy " + ventoy_get() + " downloaded"})
+        elif cmd == "ventoy":
+            ventoy(a[1], a[2])
+        elif cmd == "copy":
+            copy(a[1], a[2])
+        elif cmd == "backup":
+            backup(a[1], a[2])
+        elif cmd == "speed":
+            speed(a[1])
+        elif cmd == "probe":
+            probe(a[1], a[2], a[3])
+        elif cmd == "erase":
+            erase(a[1], a[2], a[3])
+        elif cmd == "import":
+            import_photos(a[1], a[2])
+        elif cmd == "catalog":
+            catalog(len(a) > 1 and a[1] == "refresh")
+        elif cmd == "download":
+            download(a[1], a[2], a[3] if len(a) > 3 else "")
+    except Fail as ex:
+        emit({"stage": "error", "msg": str(ex), "cancelled": STOP["flag"]})
+    except OSError as ex:
+        emit({"stage": "error", "msg": ex.strerror or str(ex)})
+
+
+if __name__ == "__main__":
+    main()

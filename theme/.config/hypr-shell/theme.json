@@ -1,0 +1,161 @@
+{
+    "accents": {
+        "count": 1,
+        "pick": 0,
+        "tint": 0.12
+    },
+    "blur": {
+        "brightness": 0.7,
+        "contrast": 0.89,
+        "noise": 0.012,
+        "passes": 2,
+        "size": 5,
+        "vibrancy": 0,
+        "vibrancyDarkness": 0.05
+    },
+    "border": {
+        "active": 0.79,
+        "inactive": 0.08
+    },
+    "dashboard": {
+        "controlHotZone": true,
+        "hotZone": true,
+        "notifHotZone": true,
+        "utilityHotZone": true,
+        "weatherCity": "hangzhou",
+        "weatherSource": "auto",
+        "weatherUnits": "metric"
+    },
+    "design": {
+        "frame": "wallpaper",
+        "layers": "tonal",
+        "mode": "solid",
+        "outlines": "none"
+    },
+    "dock": {
+        "pinned": [
+            "kitty",
+            "org.mozilla.firefox",
+            "org.gnome.Nautilus",
+            "steam"
+        ]
+    },
+    "focus": {
+        "angle": 120,
+        "colors": 1,
+        "enabled": true,
+        "lightness": 0.6,
+        "opacity": 1,
+        "saturation": 0.43,
+        "shade": 0,
+        "size": 3
+    },
+    "fonts": {
+        "mono": "JetBrains Mono",
+        "ui": "Geist"
+    },
+    "glass": {
+        "blurAmount": 1,
+        "blurStyle": "blur",
+        "islandOpacity": 0.9,
+        "opacity": 0.5,
+        "surfaceColor": "shade"
+    },
+    "glow": {
+        "brightness": 0.45,
+        "color": "black",
+        "strength": 0
+    },
+    "lock": {
+        "blur": 0,
+        "dotShape": "square",
+        "dotSize": 26
+    },
+    "motion": {
+        "fast": 150,
+        "normal": 200,
+        "slow": 220,
+        "spring": 0.7,
+        "windowClose": 220,
+        "windowOpen": 380,
+        "windowScale": 85,
+        "windowStyle": "popin"
+    },
+    "drives": {
+        "isoDir": "~/ISO",
+        "verify": true,
+        "onConnect": "nothing",
+        "autoImport": false,
+        "importDir": "~/Pictures/Imports"
+    },
+    "notes": {
+        "dir": "~/Documents/Obsidian Vault/Quick Notes"
+    },
+    "oled": {
+        "dimAfter": 10,
+        "dimLevel": 0.5,
+        "hideAfter": 0,
+        "shift": 1
+    },
+    "overrides": {
+        "accent": "",
+        "card": "",
+        "frame": "",
+        "pill": "",
+        "selected": "",
+        "text": "",
+        "tile": ""
+    },
+    "palette": {
+        "bg": "#000000",
+        "danger": "#ff6b6b",
+        "info": "#7aa2f7",
+        "panel": "#2a2a2c",
+        "success": "#8fbf9f",
+        "surface": "#171719",
+        "surfaceRaised": "#242426",
+        "text": "#ececec",
+        "warning": "#e5c07b"
+    },
+    "panel": {
+        "adaptive": true,
+        "cornerInset": 9,
+        "frameWidth": 8,
+        "joined": true,
+        "offsetX": 0,
+        "offsetY": 0,
+        "opacity": 1,
+        "railFlush": true,
+        "screenRadius": 40
+    },
+    "screenshot": {
+        "dir": "~/Pictures/Screenshots",
+        "filename": "Screenshot_%Y-%m-%d_%H-%M-%S"
+    },
+    "shadow": {
+        "size": 0.4,
+        "strength": 0.35
+    },
+    "terminal": {
+        "blur": true,
+        "opacity": 0.77,
+        "solidOpacity": 0.58,
+        "tint": 0.11
+    },
+    "theme": {
+        "mode": "auto",
+        "preset": "matugen",
+        "schemeType": "auto"
+    },
+    "vignette": {
+        "strength": 0.14
+    },
+    "window": {
+        "cornerFit": 1,
+        "gapsIn": 8,
+        "gapsOut": 14,
+        "rounding": 11,
+        "roundingFollowScreen": true,
+        "roundingPower": 4
+    }
+}

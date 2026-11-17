@@ -1,0 +1,10 @@
+#!/bin/sh
+# Exit 0 when the lid is open, 1 when closed (or the state cannot be read).
+# Used by hypridle to skip idle actions while the lid is shut, e.g. in a bag.
+for state in /proc/acpi/button/lid/*/state; do
+    [ -r "$state" ] || continue
+    if grep -q closed "$state"; then
+        exit 1
+    fi
+done
+exit 0

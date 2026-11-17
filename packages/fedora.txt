@@ -1,0 +1,72 @@
+# Fedora (dnf). hyprland, quickshell, matugen, awww and friends come from the copr lionheartp/Hyprland
+# (install.sh enables it). One package per line; installed by install.sh.
+# compositor, session, lock, idle, portals
+hyprland
+hyprland-guiutils
+hyprlock
+hypridle
+hyprpaper
+hyprpicker
+hyprpolkitagent
+uwsm
+xdg-desktop-portal
+xdg-desktop-portal-hyprland
+xdg-desktop-portal-gtk
+polkit
+# shell and theming
+quickshell
+qt6-qtsvg
+qt6-qtwayland
+qt6ct
+matugen
+awww
+stow
+python3
+python3-pillow
+# rsvg-convert: hs-cursor renders the accent cursor from the Bibata SVGs
+librsvg2-tools
+kitty
+kitty-kitten
+fish
+btop
+# clipboard, screenshots, input
+cliphist
+grim
+wl-clipboard
+libnotify
+fcitx5
+fcitx5-gtk
+fcitx5-qt
+# audio, network, power, disks
+pipewire
+pipewire-utils
+pulseaudio-utils
+wireplumber
+NetworkManager
+bluez
+upower
+power-profiles-daemon
+udisks2
+brightnessctl
+playerctl
+# tools the shell calls
+qalculate
+jq
+curl
+glib2
+xdg-utils
+nautilus
+# video and music (mpv-mpris lets the shell control it), photos
+mpv
+mpv-mpris
+loupe
+# icons and fonts (emoji and CJK fonts: the emoji menu and Chinese notes need them)
+papirus-icon-theme
+google-noto-sans-fonts
+google-noto-color-emoji-fonts
+google-noto-sans-cjk-vf-fonts
+jetbrains-mono-fonts
+# terminal greeting card (Super+T and the demo)
+fastfetch
+# the timer alarm sound
+sound-theme-freedesktop

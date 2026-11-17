@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+# Stealth Cast controller: drives OBS (headless) over its WebSocket to expose the focused
+# area / window / screen as a virtual camera, with blackout and blur regions on top.
+#
+# Each invocation does one thing and prints a JSON line on stdout, so Quickshell can drive
+# it the same way it drives grim / hyprctl: one short Process per command. The longer-lived
+# window-follow logic lives in `hs-stealthcast watch` (a detached daemon, see below).
+#
+#   hs-stealthcast ping
+#   hs-stealthcast status
+#   hs-stealthcast start
+#   hs-stealthcast stop
+#   hs-stealthcast scene <json>      # {"screen":{"w":W,"h":H},"regions":[{"id":"r1","kind":"blackout","x":..,"y":..,"w":..,"h":..}]}
+#   hs-stealthcast clear
+#   hs-stealthcast watch             # long-running: repositions regions as Hyprland windows move
+#
+# Configuration via environment: HS_OBS_HOST (default localhost), HS_OBS_PORT (4455),
+# HS_OBS_PASSWORD (""), HS_SCENE (default "Stealth Cast").
+
+import json
+import os
+import sys
+
+HOST = os.environ.get("HS_OBS_HOST", "localhost")
+PORT = int(os.environ.get("HS_OBS_PORT", "4455"))
+PASSWORD = os.environ.get("HS_OBS_PASSWORD", "")
+SCENE = os.environ.get("HS_SCENE", "Stealth Cast")
+
+# OBS color source stores color as a 32-bit ABGR integer: 0xAABBGGRR. Black, fully opaque.
+BLACK = 0xFF000000
+
+
+def client():
+    try:
+        import obsws_python as obs
+    except ImportError:
+        raise RuntimeError("obsws-python is not installed (pip install --user obsws-python)")
+    return obs.ReqClient(host=HOST, port=PORT, password=PASSWORD, timeout=3)
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def fail(msg):
+    emit({"type": "error", "msg": msg})
+    sys.exit(1)
+
+
+def scene_item_id(req, source_name):
+    for item in req.get_scene_item_list(SCENE).scene_items:
+        if item.get("sourceName") == source_name:
+            return item.get("sceneItemId")
+    return None
+
+
+def ensure_scene(req):
+    names = [s.get("sceneName") for s in req.get_scene_list().scenes]
+    if SCENE not in names:
+        req.create_scene(SCENE)
+    req.set_current_program_scene(SCENE)
+
+
+def ensure_color_source(req, name, abgr):
+    # Create only if missing; existing sources keep their color until repositioned.
+    names = [i.get("sourceName") for i in req.get_scene_item_list(SCENE).scene_items]
+    if name not in names:
+        req.create_input(SCENE, name, "color_source_v3", {"color": abgr, "width": 8, "height": 8}, True)
+
+
+def place(req, name, transform):
+    item_id = scene_item_id(req, name)
+    if item_id is None:
+        return
+    req.set_scene_item_transform(SCENE, item_id, transform)
+
+
+def do_scene(desc):
+    req = client()
+    ensure_scene(req)
+    base = req.get_video_settings()
+    bw = int(base.base_width) or 1920
+    bh = int(base.base_height) or 1080
+    sw = max(1, int(desc.get("screen", {}).get("w", bw)))
+    sh = max(1, int(desc.get("screen", {}).get("h", bh)))
+    sx, sy = bw / sw, bh / sh
+
+    for r in desc.get("regions", []):
+        rid = r.get("id") or "r%d" % r.get("x", 0)
+        name = "hs-cast-" + rid
+        kind = r.get("kind", "blackout")
+        x, y = r.get("x", 0), r.get("y", 0)
+        w, h = r.get("w", 0), r.get("h", 0)
+        if kind == "blackout":
+            ensure_color_source(req, name, BLACK)
+            place(req, name, {"positionX": x * sx, "positionY": y * sy, "width": w * sx, "height": h * sy})
+        # Blur / ghost are attached to window sources; added once the PipeWire window-capture
+        # identifier is confirmed on the live system.
+    emit({"type": "scene", "ok": True, "base": [bw, bh]})
+
+
+def main():
+    argv = sys.argv[1:]
+    cmd = argv[0] if argv else "help"
+
+    if cmd == "ping":
+        try:
+            req = client()
+            v = req.get_video_settings()
+            emit({"type": "pong", "ok": True})
+        except Exception as e:
+            emit({"type": "pong", "ok": False, "msg": str(e)})
+        return
+
+    if cmd == "status":
+        try:
+            req = client()
+            status = req.get_virtual_cam_status()
+            emit({"type": "cam", "active": bool(status.output_active)})
+        except Exception as e:
+            fail(str(e))
+        return
+
+    if cmd == "start":
+        try:
+            req = client()
+            req.start_virtual_cam()
+            emit({"type": "cam", "active": True})
+        except Exception as e:
+            fail(str(e))
+        return
+
+    if cmd == "stop":
+        try:
+            req = client()
+            req.stop_virtual_cam()
+            emit({"type": "cam", "active": False})
+        except Exception as e:
+            fail(str(e))
+        return
+
+    if cmd == "scene":
+        raw = argv[1] if len(argv) > 1 else sys.stdin.read()
+        try:
+            do_scene(json.loads(raw))
+        except Exception as e:
+            fail(str(e))
+        return
+
+    if cmd == "clear":
+        try:
+            req = client()
+            names = [s.get("sceneName") for s in req.get_scene_list().scenes]
+            if SCENE in names:
+                req.remove_scene(SCENE)
+            emit({"type": "scene", "ok": True})
+        except Exception as e:
+            fail(str(e))
+        return
+
+    if cmd == "watch":
+        # Detached window-follow loop; runs independently of Quickshell.
+        try:
+            watch()
+        except Exception as e:
+            fail(str(e))
+        return
+
+    emit({"type": "error", "msg": "unknown command: %s" % cmd})
+    sys.exit(2)
+
+
+def watch():
+    # Placeholder: listens to Hyprland IPC events and re-sends the last scene on window moves.
+    # Kept separate so the main path is testable without a long-running process.
+    import subprocess
+    last = None
+    proc = subprocess.Popen(
+        ["hyprctl", "events"],
+        stdout=subprocess.PIPE, text=True, bufsize=1,
+    )
+    for line in proc.stdout:
+        if any(e in line for e in ("openwindow>>", "closewindow>>", "movewindow>>", "activewindowv2>>")):
+            if last is not None:
+                try:
+                    do_scene(last)
+                except Exception:
+                    pass
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Wallpaper switch: generates the palette (matugen), then shows the wallpaper with a transition (awww).
+# Usage: hs-wallpaper <file> | next | random | restore
+set -euo pipefail
+
+STATE_DIR="$HOME/.local/state/hypr-shell"
+CONFIG_DIR="$HOME/.config/hypr-shell"
+WALL_DIR="${HS_WALLPAPER_DIR:-$CONFIG_DIR/wallpapers}"
+CURRENT_FILE="$STATE_DIR/wallpaper"
+
+mkdir -p "$STATE_DIR"
+
+# Recoloring can be triggered in bursts (a slider drag); runs are serialized so they never mix files.
+exec 9>"$STATE_DIR/.wallpaper.lock"
+flock 9
+
+list_walls() {
+    find "$(realpath "$WALL_DIR")" -maxdepth 1 -type f \
+        \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \) | sort
+}
+
+pick() {
+    local current=""
+    [[ -f "$CURRENT_FILE" ]] && current="$(<"$CURRENT_FILE")"
+    case "${1:-next}" in
+        restore) [[ -n "$current" ]] && echo "$current" || list_walls | head -n1 ;;
+        random) list_walls | grep -vxF "$current" | shuf -n1 ;;
+        next)
+            local all next
+            mapfile -t all < <(list_walls)
+            [[ ${#all[@]} -gt 0 ]] || { echo "no wallpapers in $WALL_DIR" >&2; exit 1; }
+            next="${all[0]}"
+            for i in "${!all[@]}"; do
+                [[ "${all[$i]}" == "$current" ]] && next="${all[$(((i + 1) % ${#all[@]}))]}"
+            done
+            echo "$next" ;;
+        *) realpath "$1" ;;
+    esac
+}
+
+img="$(pick "${1:-next}")"
+[[ -f "$img" ]] || { echo "file not found: $img" >&2; exit 1; }
+
+transition=grow
+[[ "${1:-next}" == restore ]] && transition=none
+
+# Circle center: from the caller (a wallpaper dropped on the desktop), or left by hs-wallset while the
+# crop overlay was open; the file is only trusted for two minutes.
+pos="${HS_TRANSITION_POS:-}"
+pos_file="$STATE_DIR/transition-pos"
+if [[ -z "$pos" && -f "$pos_file" ]]; then
+    (( $(date +%s) - $(stat -c %Y "$pos_file") < 120 )) && pos="$(<"$pos_file")"
+fi
+rm -f "$pos_file"
+
+# The transition starts first and runs in the background: the recoloring below takes about a second
+# and used to delay the animation by that much.
+awww_pid=""
+if [[ -z "${HS_NO_AWWW:-}" ]]; then
+    pgrep -x awww-daemon >/dev/null || { setsid -f awww-daemon 9>&- >/dev/null 2>&1; sleep 0.4; }
+    awww img "$img" \
+        --transition-type "$transition" --transition-pos "${pos:-0.5,0.5}" \
+        --transition-duration 1.2 --transition-fps 60 \
+        --transition-bezier .22,1,.36,1 &
+    awww_pid=$!
+fi
+
+theme_json="$CONFIG_DIR/theme.json"
+read_theme() {
+    python3 -c "import json,sys;print(json.load(open('$theme_json')).get('theme',{}).get('$1','$2'))" 2>/dev/null || echo "$2"
+}
+mode="$(read_theme mode dark)"
+scheme="$(read_theme schemeType auto)"
+# "auto": the hue-faithful matugen scheme; extra colors come from hs-palette.
+[[ "$scheme" == auto ]] && scheme=scheme-fidelity
+preset="$(read_theme preset matugen)"
+
+# Independent image analysis runs in parallel; each step only reads the (downscaled) picture.
+# "auto" mode needs the classification first: a light background picks the light scheme.
+if [[ "$mode" == auto ]]; then
+    hs-wallcolor "$img"
+    mode="$(python3 -c "import json;print('light' if json.load(open('$STATE_DIR/wallcolor.json')).get('light') else 'dark')" 2>/dev/null || echo dark)"
+    true &
+else
+    hs-wallcolor "$img" &
+fi
+wallcolor_pid=$!
+export HS_MODE="$mode"
+if [[ "$preset" == "matugen" ]]; then
+    hs-panelcolor "$img" &
+    panelcolor_pid=$!
+    # Grayscale pictures carry no hue: matugen would fall back to a blue accent, so use the neutral scheme.
+    [[ "$(hs-graycheck "$img")" == gray ]] && scheme=scheme-neutral
+    matugen image "$img" -c "$CONFIG_DIR/matugen.toml" -m "$mode" -t "$scheme" --prefer saturation -q
+    wait "$wallcolor_pid" || true
+    hs-accent
+    hs-palette
+    wait "$panelcolor_pid" || true
+else
+    wait "$wallcolor_pid" || true
+    hs-preset
+fi
+HS_WALLPAPER="$img" hs-apps
+
+[[ -n "$awww_pid" ]] && { wait "$awww_pid" || true; }
+
+echo "$img" > "$CURRENT_FILE"
+
+if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+    hyprctl reload >/dev/null
+fi

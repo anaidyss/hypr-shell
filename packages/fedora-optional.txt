@@ -1,0 +1,25 @@
+# Fedora, optional: the shell works without these (the matching feature is just disabled).
+wtype
+tesseract
+tesseract-langpack-eng
+tesseract-langpack-rus
+ImageMagick
+# personal package: the zh-notes picker (sing-box is not packaged: put the binary in /usr/local/bin)
+# age decrypts the stored sing-box configs (hs-secrets)
+age
+fuzzel
+# ffmpeg needs RPM Fusion (swap ffmpeg-free); spicetify and python obsws are not packaged
+# screen recording for hs-demo --record (OBS works too)
+wf-recorder
+# audio spectrum in the Media tab
+cava
+# filesystems the Drives branch can format (exFAT, FAT32, NTFS, F2FS, XFS, UDF)
+exfatprogs
+dosfstools
+ntfs-3g
+f2fs-tools
+xfsprogs
+udftools
+# Windows installer sticks from the Drives menu (extract the ISO, split install.wim for FAT32)
+p7zip-plugins
+wimlib-utils

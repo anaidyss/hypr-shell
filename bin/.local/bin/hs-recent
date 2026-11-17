@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+# Recently used or changed folders as one JSON array, newest first.
+#
+#   hs-recent [--days N] [--max N] ROOT...
+#
+# Two sources: GTK's recently-used.xbel (the folders of files opened lately) and a shallow scan of the given roots
+# for directories whose modification time is recent (a file was created or removed in them). The scan is bounded by
+# depth and skips hidden and cache directories, so it stays cheap; the shell only runs it while its branch is open.
+import calendar
+import json
+import os
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from urllib.parse import unquote, urlparse
+
+HOME = os.path.expanduser("~")
+SKIP = {"node_modules", "__pycache__", "venv", ".venv", "target", "build", "dist", "Trash", "snap"}
+
+
+def parse_args(argv):
+    days, maximum, roots = 14, 40, []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--days":
+            days = int(argv[i + 1]); i += 2
+        elif argv[i] == "--max":
+            maximum = int(argv[i + 1]); i += 2
+        else:
+            roots.append(argv[i]); i += 1
+    return days, maximum, roots
+
+
+def from_xbel(cutoff):
+    found = {}
+    try:
+        tree = ET.parse(os.path.join(HOME, ".local/share/recently-used.xbel"))
+    except (OSError, ET.ParseError):
+        return found
+    for bm in tree.getroot().iter("bookmark"):
+        url = urlparse(bm.get("href", ""))
+        if url.scheme != "file":
+            continue
+        path = unquote(url.path)
+        folder = path if os.path.isdir(path) else os.path.dirname(path)
+        if not os.path.isdir(folder) or folder == HOME:
+            continue
+        stamp = bm.get("visited") or bm.get("modified") or ""
+        try:
+            ts = calendar.timegm(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            continue
+        if ts >= cutoff and ts > found.get(folder, 0):
+            found[folder] = ts
+    return found
+
+
+def from_scan(roots, days):
+    found = {}
+    for root in roots:
+        root = os.path.expanduser(root)
+        if not os.path.isdir(root):
+            continue
+        depth = 2 if os.path.realpath(root) == HOME else 3
+        cmd = ["find", root, "-maxdepth", str(depth), "-type", "d", "-mtime", f"-{days}", "-not", "-path", "*/.*"]
+        for name in SKIP:
+            cmd += ["-not", "-path", f"*/{name}/*", "-not", "-name", name]
+        cmd += ["-printf", "%T@\t%p\n"]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=8).stdout
+        for line in out.splitlines():
+            stamp, _, path = line.partition("\t")
+            if path and path != HOME and path != root:
+                found[path] = max(found.get(path, 0), float(stamp))
+    return found
+
+
+def main():
+    days, maximum, roots = parse_args(sys.argv[1:])
+    cutoff = time.time() - days * 86400
+    merged = from_xbel(cutoff)
+    try:
+        for path, ts in from_scan(roots, days).items():
+            merged[path] = max(merged.get(path, 0), ts)
+    except subprocess.TimeoutExpired:
+        pass
+    rows = sorted(merged.items(), key=lambda kv: -kv[1])[:maximum]
+    print(json.dumps([{"path": p, "name": os.path.basename(p) or p, "parent": os.path.dirname(p).replace(HOME, "~", 1), "ts": ts} for p, ts in rows]))
+
+
+if __name__ == "__main__":
+    main()

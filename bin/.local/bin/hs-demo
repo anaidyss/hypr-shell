@@ -1,0 +1,470 @@
+#!/usr/bin/env bash
+# Scripted tour of the whole shell for screen recording: terminals with fastfetch, workspaces, hot zones, the
+# dashboard, control center, every panel branch, launcher, OSD, notifications, wallpaper and theme switching,
+# settings, lock screen, screenshot editor and game mode. Everything it changes is put back when it ends.
+# Usage: hs-demo [--record [FILE]] [--countdown N] [--speed X] [--only a,b] [--skip a,b] [--walls a.jpg,b.jpg]
+#                [--safe] [--list]
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+STATE_DIR="$HOME/.local/state/hypr-shell"
+CONFIG_DIR="$HOME/.config/hypr-shell"
+THEME_JSON="$CONFIG_DIR/theme.json"
+RUNTIME="${XDG_RUNTIME_DIR:-/tmp}"
+MINI_SOCK="unix:$RUNTIME/hs-miniterm.sock"
+
+SCENES=(terminal workspaces hotzones dashboard control menus miniterm omnibox osd notifications wallpapers theme settings lock screenshot gamemode)
+declare -A DESC=(
+    [terminal]="two kitty windows: typed fastfetch, btop, columns, float, fullscreen"
+    [workspaces]="horizontal workspace slides on empty workspaces"
+    [hotzones]="the pointer travels to the top, bottom and right edges and the branches grow out by themselves"
+    [dashboard]="all dashboard tabs"
+    [control]="control center: Wi-Fi, Bluetooth, sound, battery, VPN"
+    [menus]="media, session and every strip category with all its branches"
+    [miniterm]="the mini terminal branch with typed commands"
+    [omnibox]="the bottom launcher: apps, calculator, clipboard, notes"
+    [osd]="volume, mute and brightness OSD"
+    [notifications]="toasts: normal and critical"
+    [wallpapers]="wallpaper changes with the growing circle and instant recolor of the whole system"
+    [theme]="light/dark, presets, glass/solid"
+    [settings]="settings pages"
+    [lock]="lock screen preview with a typed (wrong) password"
+    [screenshot]="screenshot editor with annotations"
+    [gamemode]="game mode on and off"
+)
+
+SPEED=1 COUNTDOWN="" RECORD=0 REC_FILE="" ONLY="" SKIP="" WALLS="" SAFE=0
+
+usage() {
+    sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+    printf '\nScenes:\n'
+    for s in "${SCENES[@]}"; do printf '  %-14s %s\n' "$s" "${DESC[$s]}"; done
+    printf '\n--safe leaves out scenes and tabs that show private data (window thumbnails, clipboard, notes, drives, folders).\n'
+    printf 'Recording needs wf-recorder or gpu-screen-recorder; without --record start OBS yourself, use --countdown 5.\n'
+}
+
+while (($#)); do
+    case "$1" in
+        --record) RECORD=1; if [[ -n "${2:-}" && "$2" != --* ]]; then REC_FILE="$2"; shift; fi ;;
+        --countdown) COUNTDOWN="$2"; shift ;;
+        --speed) SPEED="$2"; shift ;;
+        --only) ONLY=",$2," ; shift ;;
+        --skip) SKIP=",$2,"; shift ;;
+        --walls) WALLS="$2"; shift ;;
+        --safe) SAFE=1 ;;
+        --list) for s in "${SCENES[@]}"; do printf '%-14s %s\n' "$s" "${DESC[$s]}"; done; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "hs-demo: unknown option $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+[[ -z "$COUNTDOWN" ]] && { ((RECORD)) && COUNTDOWN=3 || COUNTDOWN=0; }
+
+die() { echo "hs-demo: $*" >&2; exit 1; }
+for c in hyprctl qs jq kitty kitten python3 fastfetch; do command -v "$c" >/dev/null || die "$c is required"; done
+[[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] || die "run it inside the Hyprland session"
+qs -c hypr-shell ipc show >/dev/null 2>&1 || die "the shell is not running (qs -c hypr-shell)"
+
+# ---- helpers ----
+T0=$SECONDS
+say() { printf '\033[1;35m[%02d:%02d]\033[0m %s\n' $(((SECONDS - T0) / 60)) $(((SECONDS - T0) % 60)) "$*" >&2; }
+pause() { sleep "$(awk -v d="$1" -v s="$SPEED" 'BEGIN { printf "%.3f", d / s }')"; }
+ipc() { qs -c hypr-shell ipc call "$@" >/dev/null 2>&1; }
+hy() { hyprctl dispatch "$1" >/dev/null 2>&1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+want() {
+    [[ -z "$ONLY" || "$ONLY" == *",$1,"* ]] || return 1
+    [[ "$SKIP" != *",$1,"* ]]
+}
+
+read -r MON_W MON_H < <(hyprctl monitors -j | jq -r '[.[] | select(.focused)][0] | "\((.width / .scale) | floor) \((.height / .scale) | floor)"')
+
+cursor_to() {
+    local x=$1 y=$2 cx cy i n=16
+    IFS=', ' read -r cx cy < <(hyprctl cursorpos)
+    for ((i = 1; i <= n; i++)); do
+        hy "hl.dsp.cursor.move({ x = $((cx + (x - cx) * i / n)), y = $((cy + (y - cy) * i / n)) })"
+        sleep 0.018
+    done
+}
+
+addr_of() { hyprctl clients -j | jq -r --arg c "$1" '[.[] | select(.class == $c)][0].address // empty'; }
+
+type_into() { # sock text [delay]
+    local sock=$1 text=$2 delay=${3:-0.07} i
+    for ((i = 0; i < ${#text}; i++)); do
+        kitten @ --to "$sock" send-text -- "${text:i:1}" >/dev/null 2>&1
+        sleep "$(awk -v d="$delay" -v r="$RANDOM" -v s="$SPEED" 'BEGIN { printf "%.3f", (d * (0.6 + r / 32767 * 0.9)) / s }')"
+    done
+}
+enter_into() { kitten @ --to "$1" send-text -- $'\r' >/dev/null 2>&1; }
+
+type_prefixes() { # ipc-target ipc-function text [delay]: types into a field that has only a set-the-text IPC
+    local target=$1 fn=$2 text=$3 delay=${4:-0.13} i
+    for ((i = 1; i <= ${#text}; i++)); do
+        ipc "$target" "$fn" "${text:0:i}"
+        pause "$delay"
+    done
+}
+
+DEMO_CLASSES=()
+spawn_term() { # n
+    local n=$1 sock="unix:$RUNTIME/hs-demo-$1.sock"
+    rm -f "${sock#unix:}"
+    setsid -f kitty --class "hs-demo-$n" --listen-on "$sock" -o allow_remote_control=socket-only >/dev/null 2>&1
+    DEMO_CLASSES+=("hs-demo-$n")
+    local _
+    for _ in $(seq 60); do kitten @ --to "$sock" ls >/dev/null 2>&1 && break; sleep 0.1; done
+    pause 0.9
+}
+term_sock() { echo "unix:$RUNTIME/hs-demo-$1.sock"; }
+
+close_demo_windows() {
+    local c a
+    for c in "${DEMO_CLASSES[@]}"; do
+        a="$(addr_of "$c")"
+        [[ -n "$a" ]] || continue
+        hy "hl.dsp.window.close({ window = \"address:$a\" })"
+        pause 0.4
+        [[ -n "$(addr_of "$c")" ]] && kitten @ --to "unix:$RUNTIME/${c}.sock" close-window >/dev/null 2>&1
+    done
+    DEMO_CLASSES=()
+}
+
+# Theme tokens are edited the way the settings app does: the file, then the same follow-up commands as Theme.set.
+set_token() {
+    python3 -I - "$THEME_JSON" "$1" "$2" "$3" <<'PY'
+import json, os, sys
+p, group, key, value = sys.argv[1:5]
+d = json.load(open(p))
+d.setdefault(group, {})[key] = value
+tmp = p + ".demo"
+json.dump(d, open(tmp, "w"), indent=2, ensure_ascii=False)
+os.replace(tmp, p)
+PY
+    if [[ "$1" == theme ]]; then hs-wallpaper restore; else hs-apps; hyprctl reload >/dev/null 2>&1; fi
+}
+
+# ---- state captured before anything changes ----
+ORIG_WS="$(hyprctl activeworkspace -j | jq -r '.id')"
+ORIG_WALL="$(cat "$STATE_DIR/wallpaper" 2>/dev/null || true)"
+THEME_BAK="$(mktemp "$RUNTIME/hs-demo-theme.XXXXXX")"
+cp "$THEME_JSON" "$THEME_BAK"
+IFS=', ' read -r ORIG_CX ORIG_CY < <(hyprctl cursorpos)
+MINI_BEFORE="$(addr_of hs-miniterm)"
+GAME_BEFORE="$(qs -c hypr-shell ipc call gamemode state 2>/dev/null || echo off)"
+VOL_BEFORE="" MUTE_BEFORE=0 BRIGHT_BEFORE=""
+if have wpctl; then
+    v="$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null || true)"
+    VOL_BEFORE="$(awk '{print $2}' <<<"$v")"
+    [[ "$v" == *MUTED* ]] && MUTE_BEFORE=1
+fi
+have brightnessctl && BRIGHT_BEFORE="$(brightnessctl g 2>/dev/null || true)"
+
+# Workspaces the demo may use: 6..9 that have no windows, so nothing private is on screen.
+mapfile -t FREE_WS < <(hyprctl workspaces -j | jq -r '[.[] | select(.id >= 6 and .id <= 9 and .windows > 0) | .id] as $busy | [range(6; 10)] | map(select(. as $i | $busy | index($i) | not)) | .[]')
+((${#FREE_WS[@]})) || die "workspaces 6-9 are all in use; close something there first"
+DEMO_WS="${FREE_WS[0]}"
+
+REC_PID=""
+start_record() {
+    local out="${REC_FILE:-$HOME/Videos/hs-demo-$(date +%Y%m%d-%H%M%S).mp4}"
+    mkdir -p "$(dirname "$out")"
+    REC_FILE="$out"
+    if have wf-recorder; then
+        wf-recorder -f "$out" >/dev/null 2>&1 &
+    elif have gpu-screen-recorder; then
+        gpu-screen-recorder -w screen -f 60 -o "$out" >/dev/null 2>&1 &
+    else
+        die "no recorder: install wf-recorder (or gpu-screen-recorder), or record with OBS and drop --record"
+    fi
+    REC_PID=$!
+    say "recording to $out"
+}
+
+DONE=0
+cleanup() {
+    ((DONE)) && return
+    DONE=1
+    trap - EXIT INT TERM
+    say "restoring the session"
+    ipc panel close
+    ipc omnibox close
+    ipc settings close
+    ipc lock closePreview
+    ipc screenshot cancel
+    [[ "$GAME_BEFORE" == on ]] && ipc gamemode enable || ipc gamemode disable
+    close_demo_windows
+    [[ -z "$MINI_BEFORE" && -n "$(addr_of hs-miniterm)" ]] && hs-miniterm close >/dev/null 2>&1
+    if [[ -n "$VOL_BEFORE" ]]; then
+        wpctl set-volume @DEFAULT_AUDIO_SINK@ "$VOL_BEFORE"
+        wpctl set-mute @DEFAULT_AUDIO_SINK@ "$MUTE_BEFORE"
+    fi
+    [[ -n "$BRIGHT_BEFORE" ]] && brightnessctl set "$BRIGHT_BEFORE" >/dev/null 2>&1
+    hy "hl.dsp.focus({ workspace = $ORIG_WS })"
+    cursor_to "$ORIG_CX" "$ORIG_CY"
+    cp "$THEME_BAK" "$THEME_JSON"
+    rm -f "$THEME_BAK"
+    if [[ -n "$ORIG_WALL" && -f "$ORIG_WALL" ]]; then hs-wallpaper "$ORIG_WALL"; else hs-wallpaper restore; fi
+    if [[ -n "$REC_PID" ]]; then
+        pause 1.5
+        kill -INT "$REC_PID" 2>/dev/null
+        wait "$REC_PID" 2>/dev/null
+        say "saved $REC_FILE"
+    fi
+    say "done"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+# ---- scenes ----
+scene_terminal() {
+    spawn_term 1
+    local s1; s1="$(term_sock 1)"
+    type_into "$s1" "fastfetch" 0.09
+    pause 0.5; enter_into "$s1"
+    pause 3
+
+    spawn_term 2
+    local s2; s2="$(term_sock 2)"
+    if have btop; then
+        type_into "$s2" "btop" 0.09; pause 0.4; enter_into "$s2"; pause 3.5
+        kitten @ --to "$s2" send-text -- "q" >/dev/null 2>&1
+        pause 0.6
+    fi
+    type_into "$s2" "echo hypr-shell" 0.09; enter_into "$s2"
+    pause 1.2
+
+    hy 'hl.dsp.focus({ direction = "left" })'; pause 1.1
+    hy 'hl.dsp.focus({ direction = "right" })'; pause 1.1
+    hy 'hl.dsp.layout("colresize +conf")'; pause 1.2
+    hy 'hl.dsp.layout("colresize +conf")'; pause 1.2
+    hy 'hl.dsp.layout("swapcol l")'; pause 1.5
+    hy 'hl.dsp.window.float({ action = "toggle" })'; pause 1.6
+    hy 'hl.dsp.window.float({ action = "toggle" })'; pause 1.4
+    hy 'hl.dsp.window.fullscreen()'; pause 1.8
+    hy 'hl.dsp.window.fullscreen()'; pause 1.4
+}
+
+scene_workspaces() {
+    local ws
+    for ws in "${FREE_WS[@]:1}" "${FREE_WS[@]:0:1}"; do
+        hy "hl.dsp.focus({ workspace = $ws })"
+        pause 1.3
+    done
+    hy "hl.dsp.focus({ workspace = $DEMO_WS })"
+    pause 1
+}
+
+scene_hotzones() {
+    local cx=$((MON_W / 2)) cy=$((MON_H / 2))
+    cursor_to "$cx" "$cy"; pause 0.6
+    cursor_to "$cx" 2; pause 1.3
+    cursor_to "$cx" 170; pause 2
+    cursor_to "$cx" "$cy"; pause 1.2
+    cursor_to "$cx" $((MON_H - 2)); pause 1.3
+    cursor_to "$cx" $((MON_H - 140)); pause 2
+    cursor_to "$cx" "$cy"; pause 1.2
+    cursor_to $((MON_W - 2)) "$cy"; pause 1.3
+    cursor_to $((MON_W - 130)) "$cy"; pause 2
+    cursor_to "$cx" "$cy"; pause 1.2
+}
+
+scene_dashboard() {
+    ipc panel close; pause 0.6
+    ipc panel toggle dashboard; pause 2.6
+    local i
+    for i in 1 2 3 4; do
+        ((SAFE && i == 3)) && continue
+        ipc panel dashboardTab "$i"; pause 2.8
+    done
+    ipc panel dashboardTab 0; pause 1.6
+    ipc panel close; pause 0.9
+}
+
+scene_control() {
+    ipc panel close; pause 0.5
+    local t
+    for t in wifi bluetooth sound battery vpn; do
+        ipc panel control "$t"; pause 2.4
+    done
+    ipc panel close; pause 0.9
+}
+
+scene_menus() {
+    ipc panel close; pause 0.5
+    local k
+    for k in media session; do
+        ipc panel toggle "$k"; pause 2.4
+        ipc panel close; pause 0.8
+    done
+    local -A kinds=([windows]="layout wsview gamemode" [quick]="toggles nightlight timer" [tools]="picker emoji notes" [files]="drives recent" [shell]="railedit oled")
+    local cat
+    for cat in windows quick tools files shell; do
+        ipc panel menu "$cat"; pause 1.6
+        for k in ${kinds[$cat]}; do
+            if ((SAFE)); then case "$k" in wsview|notes|drives|recent) continue ;; esac; fi
+            ipc panel toggle "$k"; pause 2.3
+        done
+        ipc panel close; pause 0.8
+    done
+}
+
+scene_miniterm() {
+    ipc panel close; pause 0.5
+    ipc panel toggle term; pause 1.8
+    local _
+    for _ in $(seq 40); do kitten @ --to "$MINI_SOCK" ls >/dev/null 2>&1 && break; sleep 0.1; done
+    type_into "$MINI_SOCK" "uname -sr" 0.09; enter_into "$MINI_SOCK"; pause 0.9
+    type_into "$MINI_SOCK" "date" 0.09; enter_into "$MINI_SOCK"
+    pause 2.2
+    ipc panel close; pause 1
+}
+
+scene_omnibox() {
+    ipc omnibox open; pause 1.2
+    type_prefixes omnibox search "firefox" 0.14; pause 1.8
+    type_prefixes omnibox search "2+2*3" 0.18; pause 1.8
+    type_prefixes omnibox search "100 usd to eur" 0.11; pause 2.6
+    ipc omnibox search ""; pause 0.8
+    if ((!SAFE)); then
+        ipc omnibox clipboard; pause 2.6
+        ipc omnibox notes; pause 2.6
+    fi
+    ipc omnibox close; pause 1
+}
+
+scene_osd() {
+    local i
+    if have wpctl; then
+        wpctl set-mute @DEFAULT_AUDIO_SINK@ 0
+        for i in 1 2 3 4; do wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 5%+; pause 0.35; done
+        for i in 1 2 3 4 5 6 7 8; do wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-; pause 0.35; done
+        wpctl set-mute @DEFAULT_AUDIO_SINK@ 1; pause 1.2
+        wpctl set-mute @DEFAULT_AUDIO_SINK@ 0; pause 1.2
+        wpctl set-volume @DEFAULT_AUDIO_SINK@ "${VOL_BEFORE:-0.5}"
+    fi
+    if have brightnessctl; then
+        for i in 1 2 3 4; do brightnessctl -e4 -n2 set 5%- >/dev/null && ipc osd brightness; pause 0.4; done
+        for i in 1 2 3 4; do brightnessctl -e4 -n2 set 5%+ >/dev/null && ipc osd brightness; pause 0.4; done
+        [[ -n "$BRIGHT_BEFORE" ]] && brightnessctl set "$BRIGHT_BEFORE" >/dev/null
+        ipc osd brightness
+    fi
+    pause 1.5
+}
+
+scene_notifications() {
+    have notify-send || return 0
+    notify-send -a "hypr-shell" "Build finished" "Compiled in 4.2 s with no warnings."
+    pause 4.5
+    notify-send -a "Calendar" "Meeting in 10 minutes" "Design review, room 2."
+    pause 4.5
+    notify-send -a "Battery" -u critical "Battery low" "12% left, plug in the charger."
+    pause 5.5
+}
+
+scene_wallpapers() {
+    ipc panel close
+    close_demo_windows
+    hy "hl.dsp.focus({ workspace = ${FREE_WS[1]:-$DEMO_WS} })"
+    pause 1
+    # a floating terminal shows how the palette reaches the apps, the dashboard shows the shell tiles
+    spawn_term 3
+    local a; a="$(addr_of hs-demo-3)"
+    hy 'hl.dsp.window.float({ action = "enable" })'
+    hy "hl.dsp.window.resize({ x = 1000, y = 560, window = \"address:$a\" })"
+    hy "hl.dsp.window.move({ x = $(((MON_W - 1000) / 2)), y = $((MON_H - 640)), window = \"address:$a\" })"
+    type_into "$(term_sock 3)" "fastfetch" 0.08; enter_into "$(term_sock 3)"
+    pause 1.5
+    ipc panel toggle dashboard; pause 2
+
+    local walls=() w dir
+    dir="$(realpath "$CONFIG_DIR/wallpapers")"
+    if [[ -n "$WALLS" ]]; then
+        IFS=, read -ra names <<<"$WALLS"
+        for w in "${names[@]}"; do [[ -f "$w" ]] && walls+=("$w") || walls+=("$dir/$w"); done
+    else
+        mapfile -t all < <(find "$dir" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.png' -o -iname '*.webp' \) | sort)
+        local n=${#all[@]} i
+        for i in 0 1 2 3 4 5; do ((n > 0)) && walls+=("${all[$((i * n / 6))]}"); done
+        [[ -f "$dir/wallhaven-5yp9r9.jpg" ]] && walls[2]="$dir/wallhaven-5yp9r9.jpg"
+    fi
+    local pos=("0.12,0.15" "0.88,0.8" "0.5,0.5" "0.85,0.2" "0.15,0.85" "0.5,0.9") k=0
+    for w in "${walls[@]}"; do
+        [[ -f "$w" ]] || continue
+        say "wallpaper ${w##*/}"
+        HS_TRANSITION_POS="${pos[$((k % ${#pos[@]}))]}" hs-wallpaper "$w"
+        k=$((k + 1))
+        pause 2.8
+    done
+}
+
+scene_theme() {
+    ipc panel close; pause 0.5
+    ipc panel toggle dashboard; pause 1.5
+    say "theme: light"; set_token theme mode light; pause 3
+    say "theme: dark";  set_token theme mode dark; pause 3
+    local p
+    for p in catppuccin-mocha tokyo-night nord; do
+        say "preset $p"; set_token theme preset "$p"; pause 3
+    done
+    say "preset matugen"; set_token theme preset matugen; set_token theme mode auto; pause 3
+    say "design: glass"; set_token design mode glass; pause 3.2
+    say "design: solid"; set_token design mode solid; pause 3.2
+    cp "$THEME_BAK" "$THEME_JSON"
+    hs-wallpaper restore
+    pause 2
+    ipc panel close; pause 0.8
+}
+
+scene_settings() {
+    ipc panel close
+    ipc settings open; pause 2
+    local p
+    for p in colors shapes glass panel motion wallpaper sound; do
+        ipc settings page "$p"; pause 2.2
+    done
+    ipc settings page colors; pause 0.5
+    ipc settings find glass.opacity; pause 2.4
+    ipc settings close; pause 1
+}
+
+scene_lock() {
+    ipc lock preview; pause 3
+    type_prefixes lock previewType "hunter2" 0.16
+    pause 0.6
+    ipc lock previewTry "hunter2"; pause 3.2
+    ipc lock closePreview; pause 1.2
+}
+
+scene_screenshot() {
+    ipc panel close; pause 0.6
+    local w=820 h=480
+    ipc screenshot editArea $(((MON_W - w) / 2)) $(((MON_H - h) / 2)) "$w" "$h"; pause 2.6
+    ipc screenshot demo; pause 3.6
+    ipc screenshot cancel; pause 1
+}
+
+scene_gamemode() {
+    [[ "$GAME_BEFORE" == on ]] && return 0
+    ipc gamemode enable; pause 3.5
+    ipc gamemode disable; pause 2.5
+}
+
+# ---- run ----
+if ((COUNTDOWN > 0)); then
+    for ((i = COUNTDOWN; i > 0; i--)); do printf '\rstarting in %d ' "$i" >&2; sleep 1; done
+    printf '\r%20s\r' '' >&2
+fi
+((RECORD)) && start_record
+
+say "demo workspace $DEMO_WS"
+hy "hl.dsp.focus({ workspace = $DEMO_WS })"
+pause 1.2
+for s in "${SCENES[@]}"; do
+    want "$s" || continue
+    say "scene: $s"
+    "scene_$s"
+done
+pause 1

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Interactive wallpaper set: open the crop overlay when the image's aspect ratio doesn't match the
+# focused screen, so the visible region can be dragged with the mouse; otherwise apply directly.
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+STATE_DIR="$HOME/.local/state/hypr-shell"
+mkdir -p "$STATE_DIR"
+rm -f "$STATE_DIR/transition-pos"
+
+img="$(realpath "$1")"
+[[ -f "$img" ]] || { echo "file not found: $img" >&2; exit 1; }
+
+raw="$(hyprctl monitors -j 2>/dev/null | python3 -c 'import json,sys
+try:
+    m = json.load(sys.stdin)
+except Exception:
+    raise SystemExit
+f = [x for x in m if x.get("focused")] or m
+print(int(f[0]["width"]), int(f[0]["height"]))' 2>/dev/null || true)"
+read -r mw mh <<< "${raw:-1920 1080}"
+
+read -r verdict iw ih <<< "$(python3 - "$img" "$mw" "$mh" <<'PY'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1])
+w, h = im.size
+W, H = int(sys.argv[2]), int(sys.argv[3])
+diff = abs(w / h - W / H) / (W / H) if W and H and w and h else 0
+print(("match" if diff < 0.02 else "crop"), w, h)
+PY
+)"
+
+if [[ "$verdict" == "crop" ]]; then
+    [[ -n "${HS_TRANSITION_POS:-}" ]] && echo "$HS_TRANSITION_POS" > "$STATE_DIR/transition-pos"
+    qs -c hypr-shell ipc call crop open "$img" "$iw" "$ih"
+else
+    hs-wallpaper "$img"
+fi

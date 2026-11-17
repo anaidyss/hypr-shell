@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Build a recolored Bibata Modern XCursor theme.
+
+Usage: hs-cursor NAME FILL OUTLINE WATCH SPIN1,SPIN2,SPIN3,SPIN4 [--sizes 24,32,48]
+
+FILL is the cursor body, OUTLINE its edge, WATCH the disc behind the busy spinner, SPIN* the four spinner segments.
+The theme lands in ~/.local/share/icons/NAME (built in a temporary folder, then swapped in). Sources: the Bibata
+SVGs and build config in ~/.config/hypr-shell/cursor (GPL-3.0, ful1e5/Bibata_Cursor v2.0.7).
+"""
+import glob
+import io
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import tomllib
+from concurrent.futures import ThreadPoolExecutor
+
+from PIL import Image
+
+HOME = os.path.expanduser("~")
+SRC = f"{HOME}/.config/hypr-shell/cursor"
+ICONS = f"{HOME}/.local/share/icons"
+# Placeholder colors in the Bibata SVGs.
+FILL, OUTLINE, WATCH = "#00FF00", "#0000FF", "#FF0000"
+SPIN = ("#32A0DA", "#7EBA41", "#F05024", "#FCB813")
+DEFAULT_SIZES = [24, 32, 48, 64, 96]
+
+
+def renderer():
+    if shutil.which("resvg"):
+        return lambda svg, size: subprocess.run(
+            ["resvg", "-w", str(size), "-h", str(size), "-", "-c"], input=svg, capture_output=True, check=True).stdout
+    if shutil.which("rsvg-convert"):
+        return lambda svg, size: subprocess.run(
+            ["rsvg-convert", "-w", str(size), "-h", str(size)], input=svg, capture_output=True, check=True).stdout
+    sys.exit("hs-cursor: needs resvg or rsvg-convert (librsvg)")
+
+
+def argb(png):
+    """PNG bytes -> premultiplied ARGB little-endian, as Xcursor wants."""
+    im = Image.open(io.BytesIO(png)).convert("RGBA").convert("RGBa")  # RGBa = premultiplied
+    r, g, b, a = im.split()
+    # A little-endian 0xAARRGGBB word is the byte order B, G, R, A.
+    return im.width, im.height, Image.merge("RGBA", (b, g, r, a)).tobytes()
+
+
+def xcursor(images):
+    """images: list of (nominal, width, height, xhot, yhot, delay, pixels)."""
+    header = 16 + 12 * len(images)
+    toc, chunks, pos = b"", b"", header
+    for nominal, w, h, xh, yh, delay, px in images:
+        chunk = struct.pack("<9I", 36, 0xFFFD0002, nominal, 1, w, h, xh, yh, delay) + px
+        toc += struct.pack("<3I", 0xFFFD0002, nominal, pos)
+        chunks += chunk
+        pos += len(chunk)
+    return struct.pack("<4sIII", b"Xcur", 16, 0x10000, len(images)) + toc + chunks
+
+
+def main():
+    args = [a for a in sys.argv[1:]]
+    sizes = DEFAULT_SIZES
+    if "--sizes" in args:
+        i = args.index("--sizes")
+        sizes = [int(s) for s in args[i + 1].split(",")]
+        del args[i:i + 2]
+    if len(args) != 5:
+        sys.exit(__doc__.strip().splitlines()[2])
+    name, fill, outline, watch, spin = args
+    spin = spin.split(",")
+    if len(spin) != 4:
+        sys.exit("hs-cursor: four spinner colors expected")
+    colors = [(FILL, fill), (OUTLINE, outline), (WATCH, watch), *zip(SPIN, spin)]
+
+    with open(f"{SRC}/x.build.toml", "rb") as f:
+        conf = tomllib.load(f)["cursors"]
+    fb = conf.pop("fallback_settings")
+    delay_ms = fb.get("x11_delay", 40)
+
+    # Jobs: (cursor key, frame index, svg path) for every frame of every cursor.
+    frames = {}
+    for key, c in conf.items():
+        base = c["png"]
+        if "*" in base:
+            paths = sorted(glob.glob(f"{SRC}/svg/{base.split('-*')[0]}/*.svg"))
+        else:
+            paths = [f"{SRC}/svg/{base[:-4]}.svg"]
+        frames[key] = paths
+
+    svgs = {}
+    for paths in frames.values():
+        for p in paths:
+            if p not in svgs:
+                with open(p) as f:
+                    text = f.read()
+                for a, b in colors:
+                    text = text.replace(a, b).replace(a.lower(), b)
+                svgs[p] = text.encode()
+
+    render = renderer()
+    jobs = [(p, s) for p in svgs for s in sizes]
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+        done = dict(zip(jobs, pool.map(lambda j: argb(render(svgs[j[0]], j[1])), jobs)))
+
+    tmp = tempfile.mkdtemp(prefix=f".{name}-", dir=ICONS)
+    os.makedirs(f"{tmp}/cursors")
+    for key, c in conf.items():
+        xh, yh = c.get("x_hotspot", fb["x_hotspot"]), c.get("y_hotspot", fb["y_hotspot"])
+        delay = c.get("x11_delay", delay_ms)
+        images = []
+        for s in sizes:
+            for p in frames[key]:
+                w, h, px = done[(p, s)]
+                images.append((s, w, h, round(xh * s / 256), round(yh * s / 256), delay, px))
+        target = c.get("x11_name", key)
+        with open(f"{tmp}/cursors/{target}", "wb") as f:
+            f.write(xcursor(images))
+        for link in c.get("x11_symlinks", []):
+            if not os.path.lexists(f"{tmp}/cursors/{link}"):
+                os.symlink(target, f"{tmp}/cursors/{link}")
+    with open(f"{tmp}/index.theme", "w") as f:
+        f.write(f"[Icon Theme]\nName={name}\nComment=Bibata Modern recolored by hypr-shell\nInherits=hicolor\n")
+    final = f"{ICONS}/{name}"
+    if os.path.exists(final):
+        shutil.rmtree(final)
+    os.rename(tmp, final)
+    print(final)
+
+
+main()

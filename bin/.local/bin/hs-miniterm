@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Mini terminal for the shell panel: a floating kitty window that is parked on a special
+# workspace while hidden. Usage: hs-miniterm ensure | show X Y W H | hide | busy | state | esc | close
+set -euo pipefail
+
+CLASS="hs-miniterm"
+SOCK="unix:${XDG_RUNTIME_DIR:-/tmp}/hs-miniterm.sock"
+KITTY_CONF="$HOME/.config/hypr-shell/kitty/miniterm.conf"
+
+addr() { hyprctl clients -j | jq -r --arg c "$CLASS" '[.[] | select(.class == $c)][0].address // empty'; }
+
+dispatch() { hyprctl dispatch "$1" >/dev/null; }
+
+# The workspace rule w[v1] drops the outline of a window that is alone on its workspace. The mini terminal counts as
+# a second window, so the outline would come back and the tiled window would shrink by its width. While the mini
+# terminal is shown, the lone window keeps no outline; the address is remembered to undo that on hide.
+KEEP="${XDG_RUNTIME_DIR:-/tmp}/hs-miniterm.keep"
+
+keep_borderless() {
+    restore_border
+    local ws="$1" lone
+    lone="$(hyprctl clients -j | jq -r --arg c "$CLASS" --argjson ws "$ws" '
+        [.[] | select(.workspace.id == $ws and .class != $c and .hidden == false and .mapped == true)]
+        | if length == 1 then .[0].address else empty end')"
+    [[ -n "$lone" ]] || return 0
+    echo "$lone" >"$KEEP"
+    dispatch "hl.dsp.window.set_prop({ prop = \"border_size\", value = \"0\", window = \"address:$lone\" })" || true
+}
+
+restore_border() {
+    [[ -f "$KEEP" ]] || return 0
+    local a
+    a="$(cat "$KEEP")"
+    rm -f "$KEEP"
+    [[ -n "$a" ]] && hyprctl dispatch "hl.dsp.window.set_prop({ prop = \"border_size\", value = \"unset\", window = \"address:$a\" })" >/dev/null 2>&1 || true
+}
+
+ensure() {
+    [[ -n "$(addr)" ]] && return 0
+    rm -f "${SOCK#unix:}"
+    # Use the login shell: SHELL may be bash when quickshell was restarted from a bash script.
+    SHELL="$(getent passwd "$USER" | cut -d: -f7)" setsid -f kitty --config "$KITTY_CONF" --class "$CLASS" --title "$CLASS" \
+        --listen-on "$SOCK" >/dev/null 2>&1
+    for _ in $(seq 1 50); do
+        [[ -n "$(addr)" ]] && return 0
+        sleep 0.1
+    done
+    echo "hs-miniterm: window did not appear" >&2
+    return 1
+}
+
+# True when something other than the interactive shell runs in the foreground.
+busy() {
+    [[ -n "$(addr)" ]] || return 1
+    kitten @ --to "$SOCK" ls 2>/dev/null | jq -e '
+        [.[].tabs[].windows[] | select(.foreground_processes | length > 0)
+         | (.foreground_processes | map(.cmdline[0] | split("/")[-1] | ltrimstr("-")))
+         | map(select(. as $p | ["fish", "bash", "zsh", "sh", "kitten", "kitty"] | index($p) | not))
+         | select(length > 0)] | length > 0' >/dev/null
+}
+
+case "${1:-}" in
+    ensure) ensure ;;
+    show)
+        ensure
+        a="$(addr)"
+        ws="$(hyprctl activeworkspace -j | jq -r '.id')"
+        keep_borderless "$ws"
+        dispatch "hl.dsp.window.move({ workspace = $ws, window = \"address:$a\", follow = false })"
+        dispatch "hl.dsp.window.resize({ x = $4, y = $5, window = \"address:$a\" })"
+        dispatch "hl.dsp.window.move({ x = $2, y = $3, window = \"address:$a\" })"
+        # Focus the window without warping the cursor to its center.
+        warps="$(hyprctl getoption cursor:no_warps -j | jq -r '.int // 0')"
+        dispatch "function() hl.config({ cursor = { no_warps = true } }) end"
+        dispatch "hl.dsp.focus({ window = \"address:$a\" })"
+        dispatch "function() hl.config({ cursor = { no_warps = $([[ "$warps" == 1 ]] && echo true || echo false) } }) end"
+        ;;
+    hide)
+        restore_border
+        a="$(addr)"
+        [[ -n "$a" ]] && dispatch "hl.dsp.window.move({ workspace = \"special:hsterm\", window = \"address:$a\", follow = false })"
+        ;;
+    busy) busy ;;
+    esc)
+        # Escape inside the terminal: close it when idle, only minimize while something runs.
+        if busy; then :; else
+            restore_border
+            a="$(addr)"
+            [[ -n "$a" ]] && dispatch "hl.dsp.window.close({ window = \"address:$a\" })"
+        fi
+        qs -c hypr-shell ipc call panel close >/dev/null 2>&1 || true ;;
+    state)
+        if [[ -z "$(addr)" ]]; then echo none
+        elif busy; then echo busy
+        else echo idle; fi ;;
+    close)
+        if busy; then echo "busy" >&2; exit 2; fi
+        restore_border
+        a="$(addr)"
+        [[ -n "$a" ]] && dispatch "hl.dsp.window.close({ window = \"address:$a\" })"
+        ;;
+    *) echo "usage: hs-miniterm ensure|show X Y W H|hide|busy|state|esc|close" >&2; exit 1 ;;
+esac

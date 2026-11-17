@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Search DuckDuckGo Images for wallpapers and apply them.
+#
+#   hs-wallsearch search <query>   fetch thumbnails (runs in the background)
+#   hs-wallsearch pause | resume   freeze / continue the running search
+#   hs-wallsearch stop             stop the running search
+#   hs-wallsearch apply <thumb>    download the full image and set it as wallpaper
+#
+# Thumbnails land in ~/.local/state/hypr-shell/wallsearch/search_thumbs/<session>/,
+# the map thumb->full url lives in search_map.txt, and applied images are saved
+# straight into the wallpaper folder so they join the local rotation.
+set -euo pipefail
+
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+STATE_DIR="$HOME/.local/state/hypr-shell/wallsearch"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/hypr-shell/wallsearch"
+CONTROL="$RUN_DIR/control"
+MAP_FILE="$STATE_DIR/search_map.txt"
+SESSION_FILE="$STATE_DIR/current_search_session"
+WALL_DIR="${HS_WALLPAPER_DIR:-$HOME/.config/hypr-shell/wallpapers}"
+DDG="$(dirname "$(realpath "$0")")/hs-ddglink.py"
+PAUSE_TIMEOUT=600
+
+read_state() { tr -d '[:space:]' < "$CONTROL" 2>/dev/null || true; }
+
+stop_search() {
+    mkdir -p "$RUN_DIR"
+    echo stop > "$CONTROL"
+    pkill -f "$DDG" 2>/dev/null || true
+}
+
+cmd_search() {
+    local query="$1"
+    stop_search
+    sleep 0.2
+
+    local session
+    session="$(date +%s)"
+    mkdir -p "$RUN_DIR" "$STATE_DIR"
+    rm -rf "${STATE_DIR}/search_thumbs"/* 2>/dev/null || true
+    rm -f "$MAP_FILE"
+    local thumbs="$STATE_DIR/search_thumbs/$session"
+    mkdir -p "$thumbs"
+    echo "$session" > "$SESSION_FILE"
+    echo run > "$CONTROL"
+
+    python3 -u "$DDG" "$query" | while IFS='|' read -r thumb_url full_url; do
+        local state paused_at
+        state=$(read_state)
+        [[ "$state" == "stop" ]] && exit 0
+        paused_at=$SECONDS
+        while [[ "$state" == "pause" ]]; do
+            (( SECONDS - paused_at >= PAUSE_TIMEOUT )) && exit 0
+            sleep 1
+            state=$(read_state)
+        done
+
+        [[ -z "$thumb_url" || -z "$full_url" ]] && continue
+
+        local ctype
+        ctype=$(curl -s -I -L -m 3 -A "$UA" "$full_url" | grep -i 'content-type:' | tail -n1 | tr -d '\r')
+        [[ "$ctype" == *"image/"* ]] || continue
+
+        local ext="${full_url##*.}"
+        ext="${ext%%\?*}"
+        ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+        [[ "$ext" =~ ^(jpg|jpeg|png|webp|gif)$ ]] || ext="jpg"
+        local want_convert=0
+        [[ "$ext" == "webp" || "$ext" == "gif" ]] && { want_convert=1; ext="jpg"; }
+
+        local file="ddg_${session}_$(date +%s%N).$ext"
+        local tmp="$thumbs/$file.tmp"
+        curl -s -L -m 5 -A "$UA" "$thumb_url" -o "$tmp"
+
+        state=$(read_state)
+        if [[ "$state" == "stop" ]]; then
+            rm -f "$tmp"
+            exit 0
+        fi
+
+        if [[ -s "$tmp" ]]; then
+            local mime
+            mime=$(file -b --mime-type "$tmp")
+            if [[ "$mime" == image/* ]]; then
+                if [[ "$mime" == "image/webp" || "$want_convert" -eq 1 ]]; then
+                    if command -v magick >/dev/null 2>&1; then
+                        magick "$tmp" "$thumbs/$file" 2>/dev/null || mv "$tmp" "$thumbs/$file"
+                    elif command -v ffmpeg >/dev/null 2>&1; then
+                        ffmpeg -y -i "$tmp" "$thumbs/$file" >/dev/null 2>&1 || mv "$tmp" "$thumbs/$file"
+                    else
+                        mv "$tmp" "$thumbs/$file"
+                    fi
+                    rm -f "$tmp"
+                else
+                    mv "$tmp" "$thumbs/$file"
+                fi
+                echo "$file|$full_url" >> "$MAP_FILE"
+            else
+                rm -f "$tmp"
+            fi
+        else
+            rm -f "$tmp"
+        fi
+    done
+}
+
+cmd_apply() {
+    local thumb="$1"
+    local full=""
+    full="$(grep -F "${thumb}|" "$MAP_FILE" 2>/dev/null | head -n1 | cut -d'|' -f2- || true)"
+    [[ -n "$full" ]] || { echo "no full url for $thumb" >&2; exit 1; }
+
+    local ext="${full##*.}"
+    ext="${ext%%\?*}"
+    ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+    [[ "$ext" =~ ^(jpg|jpeg|png|webp)$ ]] || ext="jpg"
+
+    local dest="$WALL_DIR/ddg_$(date +%Y%m%d%H%M%S).$ext"
+    mkdir -p "$WALL_DIR"
+    curl -s -L -m 30 -A "$UA" "$full" -o "$dest"
+    [[ -s "$dest" ]] || { echo "download failed" >&2; rm -f "$dest"; exit 1; }
+    hs-wallset "$dest"
+}
+
+dispatch() {
+    case "${1:-}" in
+        search) [ -n "${2:-}" ] && cmd_search "$2" ;;
+        pause)  mkdir -p "$RUN_DIR"; echo pause > "$CONTROL" ;;
+        resume) mkdir -p "$RUN_DIR"; echo run > "$CONTROL" ;;
+        stop)   stop_search ;;
+        apply)  [ -n "${2:-}" ] && cmd_apply "$2" ;;
+        *)      echo "usage: hs-wallsearch search <query> | pause | resume | stop | apply <thumb>" >&2; exit 1 ;;
+    esac
+}
+
+dispatch "$@"

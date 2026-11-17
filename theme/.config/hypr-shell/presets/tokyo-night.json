@@ -1,0 +1,20 @@
+{
+  "mode": "dark",
+  "source": "preset:tokyo-night",
+  "crust": "#13131a",
+  "mantle": "#16161e",
+  "base": "#1a1b26",
+  "surface0": "#24283b",
+  "surface1": "#2f3549",
+  "surface2": "#444b6a",
+  "text": "#c0caf5",
+  "subtext": "#9aa5ce",
+  "outline": "#565f89",
+  "inverseSurface": "#13131a",
+  "primary": "#7aa2f7",
+  "primaryText": "#15161e",
+  "secondary": "#bb9af7",
+  "tertiary": "#7dcfff",
+  "error": "#f7768e",
+  "errorText": "#15161e"
+}

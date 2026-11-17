@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# hs-vpn-reset: rebuild everything the sing-box VPN depends on, the way a reboot would, without rebooting.
+# Stops the guards and the tunnel (killing it if it hangs), clears stale kernel routes, resets DNS and the
+# watchdog state, re-syncs the bound interface, starts the tunnel again and checks real connectivity; if that
+# still fails, reconnects the physical link and tries once more.
+# Progress goes to $XDG_RUNTIME_DIR/hs-vpn-reset.status ("step <text>", then "done ok" or "done fail").
+set -u
+
+RUN="${XDG_RUNTIME_DIR:-/tmp}"
+STATUS="$RUN/hs-vpn-reset.status"
+STATE="$HOME/.local/state/vpn-watchdog"
+MTU="$HOME/.local/state/vpn-mtu"
+CFG="$HOME/.config/sing-box"
+TUN=vpn-sb
+API=http://127.0.0.1:9090
+
+exec 9>"$RUN/hs-vpn-reset.lock"
+flock -n 9 || exit 3
+
+say() { printf '%s\n' "$1" > "$STATUS.tmp" && mv -f "$STATUS.tmp" "$STATUS"; }
+step() { say "step $1"; }
+notify() { notify-send -a VPN "$1" "${2:-}" >/dev/null 2>&1 || true; }
+
+phys_dev() { ip -o route show default 2>/dev/null | awk -v t="$TUN" '$5 != t { print $5; exit }'; }
+stale() { ip link show "$TUN" >/dev/null 2>&1 || ip rule 2>/dev/null | grep -qE '^90(0[0-9]|10):'; }
+
+stop_tunnel() {
+  step "Stopping the tunnel"
+  mkdir -p "$STATE"
+  touch "$STATE/guard.off"
+  systemctl --user stop vpn-watchdog.timer vpn-dns-pin.timer vpn-watchdog.service vpn-dns-pin.service 2>/dev/null
+  timeout 8 systemctl --user stop sing-box 2>/dev/null || systemctl --user kill -s KILL sing-box 2>/dev/null
+  pkill -x hiddify 2>/dev/null
+  pkill -x sing-box 2>/dev/null
+  systemctl --user reset-failed sing-box 2>/dev/null
+  for _ in $(seq 1 20); do stale || break; sleep 0.25; done
+}
+
+# What sing-box leaves behind after an unclean exit survives until reboot and needs root to remove.
+clear_stale() {
+  stale || return 0
+  step "Removing stale routes"
+  timeout 60 pkexec sh -c '
+    ip link del '"$TUN"' 2>/dev/null
+    for p in 9000 9001 9002 9003 9010; do while ip rule del priority $p 2>/dev/null; do :; done; done
+    ip route flush table 2022 2>/dev/null
+    true' 2>/dev/null
+}
+
+reset_dns() {
+  step "Resetting DNS"
+  local dev
+  dev=$(phys_dev)
+  [ -n "$dev" ] && resolvectl dns "$dev" 223.5.5.5 119.29.29.29 2>/dev/null
+  resolvectl reset-server-features 2>/dev/null
+  resolvectl flush-caches 2>/dev/null
+}
+
+reset_state() {
+  step "Resetting guard state"
+  rm -f "$STATE"/fail_count "$STATE"/last_action "$STATE"/backoff_until "$STATE"/backoff_level "$STATE"/user_off_logged
+  gsettings set org.gnome.system.proxy mode 'none' 2>/dev/null
+  local dev cur f
+  dev=$(phys_dev)
+  cur=$(grep -o '"default_interface": *"[^"]*"' "$CFG/config.json" 2>/dev/null | head -1 | cut -d'"' -f4)
+  if [ -n "$dev" ] && [ -n "$cur" ] && [ "$dev" != "$cur" ]; then
+    for f in "$CFG"/config*.json; do
+      sed -i "s/\"default_interface\": \"$cur\"/\"default_interface\": \"$dev\"/" "$f"
+    done
+  fi
+}
+
+wait_link() {
+  step "Waiting for the network"
+  for _ in $(seq 1 60); do [ -n "$(phys_dev)" ] && return 0; sleep 0.5; done
+  return 1
+}
+
+start_tunnel() {
+  step "Starting the tunnel"
+  rm -f "$STATE/guard.off"
+  systemctl --user start sing-box 2>/dev/null
+  for _ in $(seq 1 40); do curl -s -m 1 -o /dev/null "$API/proxies" && break; sleep 0.5; done
+  sleep 3
+  "$HOME/.local/bin/vpn-dns-pin" 2>/dev/null
+  resolvectl reset-server-features 2>/dev/null
+  resolvectl flush-caches 2>/dev/null
+  systemctl --user start vpn-dns-pin.timer vpn-watchdog.timer 2>/dev/null
+}
+
+works() {
+  step "Checking the connection"
+  local i code
+  for i in 1 2 3; do
+    code=$(curl -4 -s -o /dev/null -w '%{http_code}' -m 8 https://www.gstatic.com/generate_204 2>/dev/null)
+    [ "$code" = 204 ] && return 0
+    sleep 2
+  done
+  return 1
+}
+
+reconnect_link() {
+  local dev
+  dev=$(phys_dev)
+  [ -n "$dev" ] || dev=$(nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2 == "wifi" { print $1; exit }')
+  [ -n "$dev" ] || return 1
+  step "Reconnecting the network"
+  nmcli device disconnect "$dev" >/dev/null 2>&1
+  sleep 2
+  nmcli device connect "$dev" >/dev/null 2>&1
+}
+
+finish() {
+  if [ "$1" = ok ]; then
+    if [ -d "$MTU" ]; then
+      rm -f "$MTU/.fails" "$MTU/.tries"
+      echo healthy > "$MTU/.monitor_state"
+      echo 0 > "$MTU/.fails"
+      echo 0 > "$MTU/.tries"
+    fi
+    notify "VPN restored"
+  else
+    notify "VPN is still down" "Check the node list or run vpnstat"
+  fi
+  say "done $1"
+  [ "$1" = ok ]
+}
+
+stop_tunnel
+clear_stale
+reset_dns
+reset_state
+wait_link
+start_tunnel
+works && { finish ok; exit; }
+
+stop_tunnel
+reconnect_link
+wait_link
+clear_stale
+reset_dns
+reset_state
+start_tunnel
+works && { finish ok; exit; }
+finish fail

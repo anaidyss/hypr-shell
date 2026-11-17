@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Настройки
+Name[en]=Settings
+Comment=Внешний вид, обои, сеть, звук
+Exec=qs -c hypr-shell ipc call settings open
+Icon=preferences-system
+Terminal=false
+Categories=Settings;
+Keywords=настройки;settings;внешний вид;обои;wifi;звук;bluetooth;

@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+# Evaluate math / currency / unit expressions with qalc (libqalculate). Prints one JSON line:
+#   {"ok": true, "result": "4"}
+#   {"ok": false, "msg": "qalc is not installed"}
+# Graceful when qalc is missing, so the omnibox still opens with a hint.
+#
+# The query is normalised first, because qalc reads some everyday phrasing differently from what people mean:
+#   "10 rmb in usd"  ("in" is inches to qalc, and "rmb" is unknown)  ->  "10 CNY to USD"
+#   "100 юаней в рублях" -> "100 CNY to RUB"
+#   money results are rounded to cents.
+
+import json
+import re
+import subprocess
+import sys
+
+CURRENCIES = [
+    (r"rmb|renminbi|yuan|kuai|元|юан[а-я]*|рмб", "CNY"),
+    (r"dollars?|bucks?|доллар[а-я]*|бакс[а-я]*", "USD"),
+    (r"euros?|евро", "EUR"),
+    (r"rubles?|roubles?|рубл[а-я]*", "RUB"),
+    (r"pounds? sterling|фунт[а-я]* стерлингов", "GBP"),
+    (r"yen|иен[а-я]*", "JPY"),
+]
+
+MONEY = re.compile(r"^(?P<pre>[$€£¥₽₴₹]|[A-Z]{3} )(?P<num>-?\d+\.\d{3,})$")
+
+
+def normalise(expr):
+    for pattern, code in CURRENCIES:
+        expr = re.sub(r"(?<![\w])(?:%s)(?![\w])" % pattern, code, expr, flags=re.IGNORECASE)
+    # "10 CNY in USD" is a conversion; qalc would read "in" as inches. Keep "5 in to cm" and "5 in * 2" as they are.
+    expr = re.sub(r"(?<=\S)\s+in\s+(?=(?!to\b)[^\W\d_]|[$€£¥₽₴₹])", " to ", expr, flags=re.IGNORECASE)
+    expr = re.sub(r"(?<=\S)\s+(?:в|во)\s+(?=[^\W\d_]|[$€£¥₽₴₹])", " to ", expr, flags=re.IGNORECASE)
+    return expr
+
+
+def tidy(result):
+    m = MONEY.match(result.strip())
+    if not m:
+        return result
+    value = float(m.group("num"))
+    return "%s%.2f" % (m.group("pre"), value)
+
+
+expr = " ".join(sys.argv[1:]).strip()
+if not expr:
+    print(json.dumps({"ok": True, "result": ""}))
+    sys.exit(0)
+
+expr = normalise(expr)
+
+try:
+    r = subprocess.run(["qalc", "-t", expr], capture_output=True, text=True, timeout=10)
+except FileNotFoundError:
+    print(json.dumps({"ok": False, "msg": "qalc is not installed"}))
+    sys.exit(0)
+except subprocess.TimeoutExpired:
+    print(json.dumps({"ok": False, "msg": "timed out"}))
+    sys.exit(0)
+
+lines = (r.stdout or r.stderr).strip().splitlines()
+result = tidy(lines[0]) if lines else ""
+print(json.dumps({"ok": r.returncode == 0 and result != "", "result": result}, ensure_ascii=False))

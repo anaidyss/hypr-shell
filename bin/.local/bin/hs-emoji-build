@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Build the compact emoji dataset used by the shell's emoji menu (data/emoji.json).
+
+Sources (system packages, only needed to rebuild): the Unicode emoji-test file (groups, order, names; shipped with
+ibus-typing-booster) and the CLDR annotations (keywords in English and Russian; package unicode-cldr).
+Usage: hs-emoji-build [output.json]
+"""
+import gzip
+import json
+import os
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+HOME = os.path.expanduser("~")
+OUT = sys.argv[1] if len(sys.argv) > 1 else f"{HOME}/hypr-shell/quickshell/.config/quickshell/hypr-shell/data/emoji.json"
+TEST = "/usr/share/ibus-typing-booster/data/emoji-test.txt.gz"
+CLDR = "/usr/share/unicode/cldr/common/annotations"
+
+ICONS = {
+    "Smileys & Emotion": "\U0001F600", "People & Body": "\U0001F44B", "Animals & Nature": "\U0001F43B",
+    "Food & Drink": "\U0001F34E", "Travel & Places": "\U0001F697", "Activities": "⚽",
+    "Objects": "\U0001F4A1", "Symbols": "❤️", "Flags": "\U0001F3C1",
+}
+
+
+def annotations(lang):
+    words, names = {}, {}
+    path = f"{CLDR}/{lang}.xml"
+    if not os.path.exists(path):
+        return words, names
+    for a in ET.parse(path).getroot().iter("annotation"):
+        cp = a.get("cp")
+        if a.get("type") == "tts":
+            names[cp] = a.text or ""
+        else:
+            words[cp] = (a.text or "").replace("|", " ")
+    return words, names
+
+
+def lookup(table, ch):
+    return table.get(ch) or table.get(ch.replace("️", "")) or ""
+
+
+en_w, en_n = annotations("en")
+ru_w, ru_n = annotations("ru")
+
+opener = gzip.open if TEST.endswith(".gz") else open
+groups, order = {}, []
+group = ""
+with opener(TEST, "rt", encoding="utf-8") as f:
+    for line in f:
+        if line.startswith("# group:"):
+            group = line.split(":", 1)[1].strip()
+            continue
+        if line.startswith("#") or not line.strip() or group in ("", "Component"):
+            continue
+        m = re.match(r"^([0-9A-F ]+);\s*fully-qualified\s*#\s*(\S+)\s+E[\d.]+\s+(.*)$", line.strip())
+        if not m:
+            continue
+        ch, name = m.group(2), m.group(3)
+        if any(0x1F3FB <= ord(c) <= 0x1F3FF for c in ch):
+            continue  # skin tone variants stay out of the grid
+        kw = " ".join(x for x in (lookup(en_w, ch), lookup(ru_w, ch), lookup(ru_n, ch)) if x)
+        # Words already in the name are not repeated.
+        have = set(name.lower().split())
+        kw = " ".join(w for w in dict.fromkeys(kw.lower().split()) if w not in have)
+        if group not in groups:
+            groups[group] = []
+            order.append(group)
+        groups[group].append([ch, name, kw])
+
+data = {"groups": [{"id": g.lower().split(" ")[0].replace("&", ""), "title": g, "icon": ICONS.get(g, ""), "items": groups[g]} for g in order]}
+os.makedirs(os.path.dirname(OUT), exist_ok=True)
+with open(OUT, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+print(sum(len(g["items"]) for g in data["groups"]), "emoji,", len(data["groups"]), "groups ->", OUT)

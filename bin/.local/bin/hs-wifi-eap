@@ -1,0 +1,31 @@
+#!/bin/sh
+# hs-wifi-eap: save a WPA-Enterprise (802.1X) Wi-Fi network and connect to it.
+# Reads three lines from stdin: SSID, login, password, so the password never shows up in argv.
+# PEAP + MSCHAPv2 without a CA certificate: what campus networks usually expect from phones.
+# A previous profile with the same name is replaced, so a retry with a fixed password just works.
+IFS= read -r ssid || exit 2
+IFS= read -r user || exit 2
+IFS= read -r pass || exit 2
+[ -n "$ssid" ] && [ -n "$user" ] && [ -n "$pass" ] || exit 2
+
+nmcli connection delete id "$ssid" >/dev/null 2>&1
+
+printf '%s\n' \
+    "set 802-11-wireless.ssid $ssid" \
+    "set 802-11-wireless-security.key-mgmt wpa-eap" \
+    "set 802-1x.eap peap" \
+    "set 802-1x.phase2-auth mschapv2" \
+    "set 802-1x.identity $user" \
+    "set 802-1x.password $pass" \
+    "set connection.autoconnect no" \
+    "save" \
+    "quit" | nmcli connection edit type wifi con-name "$ssid" >/dev/null 2>&1 || exit 3
+# Autoconnect is turned on only after saving: with it on, the editor asks "save anyway?" and eats the next line.
+nmcli connection show id "$ssid" >/dev/null 2>&1 || exit 3
+nmcli connection modify id "$ssid" connection.autoconnect yes >/dev/null 2>&1
+
+if ! nmcli -w 45 connection up id "$ssid" >/dev/null 2>&1; then
+    # Keep no broken profile around: the panel would show it as saved and silently fail again.
+    nmcli connection delete id "$ssid" >/dev/null 2>&1
+    exit 4
+fi

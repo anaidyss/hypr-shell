@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Vivid accent for two-color wallpapers.
+
+Reads wallcolor.json; when the wallpaper is "duo" (black background plus one bright hue),
+overrides matugen's washed-out primary/secondary/tertiary in colors.json and colors.lua with
+a vivid version of the second color, so a black + red picture accents the shell in red.
+"""
+
+import json
+import os
+import re
+import sys
+
+home = os.path.expanduser("~")
+state = os.path.join(home, ".local", "state", "hypr-shell")
+
+try:
+    wc = json.load(open(os.path.join(state, "wallcolor.json")))
+except Exception:
+    sys.exit(0)
+
+if wc.get("type") != "duo" or "accent" not in wc:
+    sys.exit(0)
+
+accent = wc["accent"].lstrip("#")
+accent_text = wc.get("accent_text", "000000").lstrip("#")
+
+
+def mix_toward_white(hexc, t):
+    return "".join(
+        "%02x" % round(int(hexc[i:i + 2], 16) + (255 - int(hexc[i:i + 2], 16)) * t)
+        for i in (0, 2, 4)
+    )
+
+
+secondary = mix_toward_white(accent, 0.14)
+tertiary = mix_toward_white(accent, 0.28)
+
+jpath = os.path.join(state, "colors.json")
+try:
+    data = json.load(open(jpath))
+except Exception:
+    data = {}
+data["primary"] = "#" + accent
+data["primaryText"] = "#" + accent_text
+data["secondary"] = "#" + secondary
+data["tertiary"] = "#" + tertiary
+json.dump(data, open(jpath, "w"), indent=2)
+
+lpath = os.path.join(state, "colors.lua")
+try:
+    text = open(lpath).read()
+except Exception:
+    text = ""
+for key, val in (("primary", accent), ("primaryText", accent_text), ("secondary", secondary), ("tertiary", tertiary)):
+    text = re.sub(r'(%s\s*=\s*")[0-9a-fA-F]{6}' % key, r"\g<1>" + val, text)
+open(lpath, "w").write(text)

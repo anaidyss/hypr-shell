@@ -1,0 +1,906 @@
+#!/usr/bin/env python3
+"""App theming from the hypr-shell tokens: kitty, GTK 3/4 (Nautilus), qt6ct, fish, starship, hyprlock,
+Firefox, Telegram, Spotify (spicetify), Obsidian, VSCodium, btop, mpv, the cursor (Bibata by scheme).
+
+Sources: ~/.config/hypr-shell/theme.json (neutrals, glass) and ~/.local/state/hypr-shell/colors.json (accent from the wallpaper).
+Output: ~/.local/state/hypr-shell/apps/*, plus GTK/qt6ct in their config dirs (new files only, foreign files are left alone).
+  hs-apps            generate everything
+  hs-apps gtk on|off add/remove the @import line in ~/.config/gtk-{3,4}.0/gtk.css
+  hs-apps <app>...   generate only the named apps (gtk firefox telegram spotify obsidian vscode btop ...)
+  hs-apps telegram apply   ask the running Telegram to preview the generated theme
+Apps listed in theme.json apps.disabled are skipped. Templates: ~/.config/hypr-shell/templates/apps.
+"""
+import colorsys
+import configparser
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import zipfile
+
+HOME = os.path.expanduser("~")
+CONFIG = f"{HOME}/.config/hypr-shell/theme.json"
+COLORS = f"{HOME}/.local/state/hypr-shell/colors.json"
+OUT = f"{HOME}/.local/state/hypr-shell/apps"
+MARK_BEGIN, MARK_END = "/* BEGIN hypr-shell */", "/* END hypr-shell */"
+
+PALETTE = {"bg": "#000000", "surface": "#171719", "surfaceRaised": "#242426", "text": "#ececec", "danger": "#ff6b6b"}
+GLASS = {"opacity": 0.85}
+
+
+def load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def hexs(c):
+    return "#%02x%02x%02x" % tuple(round(v) for v in c)
+
+
+def mix(a, b, t):
+    ca, cb = rgb(a), rgb(b)
+    return hexs(tuple(x + (y - x) * t for x, y in zip(ca, cb)))
+
+
+def rgba(h, a):
+    r, g, b = rgb(h)
+    return f"rgba({r}, {g}, {b}, {a:.3g})"
+
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path) as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    with open(path, "w") as f:
+        f.write(text)
+    return True
+
+
+cfg = load(CONFIG)
+pal = {**PALETTE, **cfg.get("palette", {})}
+opacity = cfg.get("glass", {}).get("opacity", GLASS["opacity"])
+col = load(COLORS)
+# Wallpaper-derived roles override the neutral fallbacks when present.
+pal["bg"] = col.get("crust", pal.get("bg", "#000000"))
+pal["surface"] = col.get("base", pal.get("surface", "#171719"))
+pal["surfaceRaised"] = col.get("surface1", pal.get("surfaceRaised", "#242426"))
+pal["text"] = col.get("text", pal.get("text", "#ececec"))
+pal["danger"] = col.get("error", pal.get("danger", "#ff6b6b"))
+accent = col.get("primary", "#8ab4a0")
+accent_text = col.get("primaryText", "#07120d")
+secondary = col.get("secondary", "#bfc6dc")
+tertiary = col.get("tertiary", "#debcdf")
+border = cfg.get("border", {})
+border_active = border.get("active", 0.35)
+border_inactive = border.get("inactive", 0.08)
+text, surface, raised, danger = pal["text"], pal["surface"], pal["surfaceRaised"], pal["danger"]
+# The light scheme (chosen, or picked for a light wallpaper in "auto") flips the neutral ramp: light bodies, dark text,
+# dark ink for borders and veils (`ink`: the contrast color, white on dark bodies, black on light ones).
+light = col.get("mode") == "light"
+scheme = "light" if light else "dark"
+ink = "#000000" if light else "#ffffff"
+ink_rgb = "0, 0, 0" if light else "255, 255, 255"
+dim = mix(surface, text, 0.55)
+selection = mix(surface, accent, 0.30)
+# The frame color (also the terminal's border accent) follows the panel color setting:
+# accent takes the wallpaper's second color on two-color pictures or a tinted base otherwise.
+wallcolor = load(f"{HOME}/.local/state/hypr-shell/wallcolor.json")
+surface_color = cfg.get("glass", {}).get("surfaceColor", "accent")
+if surface_color == "black":
+    frame_color = "#0b0b0e"
+elif surface_color == "shade":
+    # The darkest tone of the wallpaper palette (matugen surface-container-lowest).
+    frame_color = col.get("crust", "#0b0b0e")
+elif surface_color == "gray":
+    # Gray is the muted tone: tinted with the main hue from the third color on (mirrors Theme.mutedGray).
+    accents = cfg.get("accents", {})
+    # On two-color (black plus one hue) wallpapers the gray is black with only a faint tint.
+    duo = wallcolor.get("type") == "duo"
+    base = "#0b0b0e" if duo else pal["panel"]
+    tint = accents.get("tint", 0.12) * (0.4 if duo else 1)
+    frame_color = mix(base, accent, tint) if accents.get("count", 4) >= 3 else base
+elif wallcolor.get("type") == "duo" and wallcolor.get("color"):
+    frame_color = wallcolor.get("color")
+else:
+    frame_color = mix(surface, accent, 0.22)
+# Solid design mode (mirrors Theme.solid): no transparency, the frame takes the wallpaper's flat background color.
+design_mode = cfg.get("design", {}).get("mode", "auto")
+solid_mode = design_mode == "solid"
+if solid_mode:
+    use_wall = cfg.get("design", {}).get("frame", "wallpaper") == "wallpaper"
+    light_scheme = col.get("mode") == "light"
+    wall_frame = (wallcolor.get("bg") if light_scheme else wallcolor.get("solid")) if wallcolor.get("flat") else None
+    frame_color = wall_frame if use_wall and wall_frame else col.get("base", frame_color)
+    opacity = 1.0
+# Mirrors Theme.panelTarget: in the light scheme a dark frame color is washed toward white, keeping its hue.
+if light and colorsys.rgb_to_hls(*(v / 255 for v in rgb(frame_color)))[1] < 0.75:
+    frame_color = mix(frame_color, "#ffffff", 0.82)
+# The window border reuses this same frame color (Hyprland reads it from frame.lua).
+write(f"{HOME}/.local/state/hypr-shell/frame.lua", f'return {{ frame_color = "{frame_color.lstrip("#")}" }}\n')
+# The terminal body is the neutral wallpaper tone (transparent), only the border carries the frame color.
+# The terminal is always transparent. Glass: a clean near-black that is almost invisible. Solid: a denser body with a
+# slight tint of the system (frame) color; Hyprland keeps its small blur behind it. The border keeps the frame color.
+def hued(c, lift, smin=0.16, smax=0.35):
+    """The hue of `c` with its lightness raised a little and a visible amount of color (what the lock cards do)."""
+    r, g, b = (v / 255 for v in rgb(c))
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    r, g, b = colorsys.hls_to_rgb(h, min(0.32, l + lift), max(smin, min(smax, s)))
+    return "#{:02x}{:02x}{:02x}".format(round(r * 255), round(g * 255), round(b * 255))
+
+
+term_cfg = cfg.get("terminal", {})
+# The body carries the wallpaper's Material You tone like the dashboards do: the hue of the frame (solid) or of the
+# scheme's base (glass), lifted a little, instead of a neutral near-black. How much hue is the `terminal.tint` setting.
+term_tint = term_cfg.get("tint", 0.12)
+term_bg = hued(mix("#0c0c0e", col.get("base", "#211a17"), 0.5), 0.0, term_tint, term_tint)
+if light:
+    term_bg = mix("#f6f6f7", col.get("base", "#fcf2e3"), 0.5)
+term_opacity = term_cfg.get("opacity", 0.25)
+if solid_mode:
+    term_bg = mix("#f2f2f4", frame_color, 0.22) if light else hued(frame_color, 0.04, term_tint, term_tint)
+    term_opacity = term_cfg.get("solidOpacity", 0.8)
+term_border = frame_color
+term_dim = mix(term_bg, text, 0.55)
+term_selection = mix(term_bg, text, 0.28)
+term_inactive = mix(term_bg, text, 0.15)
+
+# The 16 terminal colors follow the Material You roles: neutrals for the blacks/whites,
+# the semantic red/green/yellow for the fixed palette, and secondary/accent/tertiary for the blue/magenta/cyan trio.
+def role(name, fallback):
+    return col.get(name, pal.get(name, fallback))
+
+
+def lift(h, t=0.22):
+    """The bright twin of an ANSI color: lighter on a dark body, a little deeper on a light one."""
+    return mix(h, "#000000", t * 0.6) if light else mix(h, "#ffffff", t)
+
+
+def readable(h):
+    """The fixed semantic colors (pale green and yellow) wash out on a light body; pull them toward the text."""
+    return mix(h, text, 0.45) if light else h
+
+
+base_ansi = [
+    # On a light body "black" stays dark and "white" light, as programs expect, so the neutrals swap ends.
+    role("inverseSurface", text) if light else role("crust", pal["bg"]),  # 0 black
+    role("error", pal["danger"]),        # 1 red
+    readable(pal.get("success", "#8fbf9f")),  # 2 green
+    readable(pal.get("warning", "#e5c07b")),  # 3 yellow
+    role("secondary", "#7aa2f7"),        # 4 blue
+    accent,                              # 5 magenta (accent)
+    role("tertiary", "#7dcfff"),         # 6 cyan
+    role("surface2", "#ebe1d2") if light else role("subtext", pal["text"]),  # 7 white
+]
+ANSI = base_ansi + [lift(c) for c in base_ansi]
+if light:
+    ANSI[8], ANSI[15] = role("outline", "#807661"), role("crust", "#ffffff")
+
+
+# ---- Shared values for the app templates (GTK shape, Firefox, Spotify, Obsidian, ...) ----
+TPL = f"{HOME}/.config/hypr-shell/templates/apps"
+_win = cfg.get("window", {})
+rounding = int(_win.get("rounding", 26))
+# Same scale as Theme.qml: radiusSm = 0.75x, radiusMd = 1x, radiusLg = 1.5x; rows inside popups are 0.6x radiusSm.
+rs, rm, rl = round(rounding * 0.75), rounding, round(rounding * 1.5)
+ri = round(rs * 0.6)
+ui_font = cfg.get("fonts", {}).get("ui", "Geist")
+mono_font = cfg.get("fonts", {}).get("mono", "JetBrains Mono")
+
+# Neutral ramp: the terminal's near-black with a faint wallpaper tint, lifted toward the text color.
+# In the light scheme the ramp starts from a near-white with the scheme's warm base instead.
+app_bg = mix("#f7f7f8", col.get("base", "#fcf2e3"), 0.55) if light else mix("#0c0c0e", pal["bg"], 0.4)
+app_raised = mix(app_bg, text, 0.055)
+app_high = mix(app_bg, text, 0.10)
+app_pill = mix(app_bg, text, 0.15)
+app_mute = mix(app_bg, text, 0.40)
+app_dim = mix(app_bg, text, 0.62)
+accent_dim = mix(accent, ink, 0.18)
+link = mix(accent, text, 0.35)
+text_bright = mix(text, ink, 0.5)
+app_selection = mix(app_bg, accent, 0.30)
+
+
+def on(h):
+    """Text color that reads on the fill `h`: near-black on light fills, near-white on dark ones."""
+    r, g, b = rgb(h)
+    return "#17150f" if (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 > 0.55 else "#f4f4f5"
+
+
+def triple(h):
+    return ", ".join(str(v) for v in rgb(h))
+
+
+def bare(h):
+    return h.lstrip("#")
+
+
+V = {
+    "bg": app_bg, "raised": app_raised, "high": app_high, "pill": app_pill, "mute": app_mute, "dim": app_dim,
+    "text": text, "text_bright": text_bright, "selection": app_selection,
+    "accent": accent, "accent_dim": accent_dim, "accent_text": accent_text, "link": link,
+    "secondary": secondary, "tertiary": tertiary, "danger": danger,
+    "success": pal.get("success", "#8fbf9f"), "warning": pal.get("warning", "#e5c07b"),
+    "border": f"rgba({ink_rgb}, 0.08)", "border_soft": f"rgba({ink_rgb}, 0.14)", "scheme": scheme,
+    "border_hard": f"rgba({triple(accent)}, 0.45)", "accent_glow": f"rgba({triple(accent)}, 0.30)",
+    "rs": rs, "rm": rm, "rl": rl, "ri": ri, "rounding": rounding,
+    "font_ui": f'"{ui_font}", "Noto Sans", sans-serif', "font_mono": f'"{mono_font}", monospace',
+    "bg_70": rgba(app_bg, 0.7),
+}
+for _k in ("accent", "danger", "bg", "tertiary", "secondary"):
+    V[f"{_k}_rgb"] = triple(V[_k])
+for _k in ("bg", "raised", "high", "pill", "mute", "dim", "text", "accent", "accent_dim", "danger"):
+    V[f"{_k}_x"] = bare(V[_k])
+
+
+def render(name):
+    with open(f"{TPL}/{name}") as f:
+        text_ = f.read()
+    return re.sub(r"\{\{(\w+)\}\}", lambda m: str(V[m.group(1)]), text_)
+
+
+
+def kitty():
+    lines = [
+        "# Generated by hs-apps from the hypr-shell tokens, do not edit.",
+        f"background_opacity {term_opacity:.2f}",
+        # Room above and below the text (and a little at the sides) so it stays clear of the rounded window corners.
+        "window_padding_width 16 8",
+        f"foreground {text}", f"background {term_bg}",
+        f"selection_foreground {text}", f"selection_background {term_selection}",
+        f"cursor {accent}", f"cursor_text_color {accent_text}",
+        f"url_color {accent}",
+        f"active_border_color {term_border}", f"inactive_border_color {term_inactive}",
+        f"active_tab_foreground {on(term_border)}", f"active_tab_background {term_border}",
+        f"inactive_tab_foreground {term_dim}", f"inactive_tab_background {term_bg}",
+        f"tab_bar_background {pal['bg']}",
+        f"mark1_foreground {term_bg}", f"mark1_background {term_border}",
+    ]
+    # Faint text (SGR 2: the fastfetch mark's lower rows, dim prompts) is drawn at dim_opacity; kitty's 0.4 is fine on a
+    # dark body but nearly vanishes on a light one.
+    lines.append(f"dim_opacity {0.7 if light else 0.4}")
+    lines += [f"color{i} {c}" for i, c in enumerate(ANSI)]
+    return write(f"{OUT}/kitty.conf", "\n".join(lines) + "\n")
+
+
+def gtk():
+    named = {
+        "accent_color": accent, "accent_bg_color": accent, "accent_fg_color": accent_text,
+        "destructive_color": danger, "destructive_bg_color": danger, "destructive_fg_color": pal["bg"],
+        "error_color": danger, "error_bg_color": danger, "error_fg_color": pal["bg"],
+        "window_fg_color": text, "view_fg_color": text, "headerbar_fg_color": text,
+        "card_fg_color": text, "popover_fg_color": text, "sidebar_fg_color": text,
+        "dialog_fg_color": text, "thumbnail_fg_color": text,
+    }
+    glass = rgba(app_bg, opacity)
+    solid = {
+        "window_bg_color": glass, "view_bg_color": "transparent", "headerbar_bg_color": glass,
+        "headerbar_backdrop_color": glass, "sidebar_bg_color": glass, "sidebar_backdrop_color": glass,
+        "secondary_sidebar_bg_color": glass, "dialog_bg_color": rgba(app_raised, min(1, opacity + 0.05)),
+        "popover_bg_color": rgba(app_raised, min(1, opacity + 0.05)), "card_bg_color": f"rgba({ink_rgb}, 0.05)",
+        "thumbnail_bg_color": f"rgba({ink_rgb}, 0.05)",
+        "headerbar_border_color": f"rgba({ink_rgb}, {border_inactive})",
+        "headerbar_shade_color": "transparent", "headerbar_darker_shade_color": "transparent",
+        "sidebar_shade_color": "transparent", "sidebar_border_color": f"rgba({ink_rgb}, {border_inactive})",
+        "shade_color": f"rgba(0, 0, 0, {0.08 if light else 0.25})", "scrollbar_outline_color": "transparent",
+    }
+    css = ["/* Generated by hs-apps from the hypr-shell tokens, do not edit. */"]
+    css += [f"@define-color {k} {v};" for k, v in {**named, **solid}.items()]
+    # GTK3 without libadwaita uses the theme_* names.
+    css += [f"@define-color theme_bg_color {glass};", f"@define-color theme_fg_color {text};",
+            f"@define-color theme_base_color {app_bg};", f"@define-color theme_text_color {text};",
+            f"@define-color theme_selected_bg_color {accent};", f"@define-color theme_selected_fg_color {accent_text};"]
+    css += ["headerbar, .titlebar { box-shadow: none; background-image: none; }"]
+    body = "\n".join(css) + "\n" + render("gtk-shape.css")
+    changed = False
+    for v in ("3.0", "4.0"):
+        changed |= write(f"{HOME}/.config/gtk-{v}/hypr-shell.css", body)
+    return changed
+
+
+def qt():
+    def c(h):
+        return "#ff" + h.lstrip("#")
+
+    # Light/Midlight are the bevel highlights: lighter than the button on both schemes.
+    hi = "#ffffff" if light else text
+    roles = [text, raised, mix(raised, hi, 0.2), mix(raised, hi, 0.1), mix(surface, "#000000", 0.4),
+             mix(surface, "#000000", 0.2), text, text, text, surface, surface, "#000000",
+             accent, accent_text, accent, mix(accent, text, 0.4), raised, raised, raised, text, dim, accent]
+    dis = [dim if i in (0, 6, 8) else r for i, r in enumerate(roles)]
+    body = "[ColorScheme]\n"
+    body += "active_colors=" + ", ".join(c(r) for r in roles) + "\n"
+    body += "disabled_colors=" + ", ".join(c(r) for r in dis) + "\n"
+    body += "inactive_colors=" + ", ".join(c(r) for r in roles) + "\n"
+    changed = write(f"{HOME}/.config/qt6ct/colors/hypr-shell.conf", body)
+    conf = f"{HOME}/.config/qt6ct/qt6ct.conf"
+    if not os.path.exists(conf):
+        write(conf, "[Appearance]\ncolor_scheme_path=" + f"{HOME}/.config/qt6ct/colors/hypr-shell.conf\n"
+              "custom_palette=true\nstyle=Fusion\nstandard_dialogs=default\n")
+    return changed
+
+
+def fish():
+    keys = {
+        "fish_color_normal": text, "fish_color_command": accent, "fish_color_keyword": ANSI[5],
+        "fish_color_quote": ANSI[3], "fish_color_redirection": ANSI[6], "fish_color_end": ANSI[4],
+        "fish_color_error": danger, "fish_color_param": text, "fish_color_comment": dim,
+        "fish_color_selection": f"--background={selection}", "fish_color_search_match": f"--background={selection}",
+        "fish_color_operator": accent, "fish_color_escape": ANSI[6], "fish_color_autosuggestion": dim,
+        "fish_color_cwd": accent, "fish_color_user": ANSI[2], "fish_color_host": text,
+        "fish_pager_color_progress": dim, "fish_pager_color_prefix": accent,
+        "fish_pager_color_completion": text, "fish_pager_color_description": dim,
+        "fish_pager_color_selected_background": f"--background={selection}",
+    }
+    lines = ["# Generated by hs-apps from the hypr-shell tokens, do not edit."]
+    lines += [f"set -g {k} {v.replace('#', '')}" for k, v in keys.items()]
+    return write(f"{OUT}/colors.fish", "\n".join(lines) + "\n")
+
+
+def fastfetch():
+    # Compact: the minimal Arch mark, a boxed info block and a row of dots. Every color is a terminal palette index
+    # (accent = ANSI 5, its lifted twin = 13, secondary = 4, tertiary = 6, ...), never a fixed RGB value: kitty
+    # recolors already printed text when hs-apps reloads its palette, so the card follows the wallpaper live.
+    # The fish function in conf.d/hypr-shell.fish points fastfetch at this file.
+    def sgr(code):
+        return f"\u001b[{code}m"
+
+    # The frame is faint white on a dark body; on a light one ANSI 7 is a pale surface tone and faint made it vanish,
+    # so it takes bright black (the scheme's outline color) at full strength instead.
+    ACCENT, ACCENT_HI, DIM = "35", "95", "90" if light else "2;37"
+    # The mark has nine rows, the box nine rows too, so the two blocks end together; the mark fades in three steps
+    # (lifted accent, accent, faint accent), each a color $1..$9 of the logo file.
+    art = [
+        "        /\\", "       /  \\", "      /    \\", "     _\\     \\", "    /        \\",
+        "   /          \\", "  /     __   \\_\\", " /     /  \\     \\", "/__,--'    '--,__\\",
+    ]
+    mark = ["\u2800"] + [f"${i + 1}{row}" for i, row in enumerate(art)]
+    logo_colors = {str(i + 1): (ACCENT_HI, ACCENT, "2;35")[i // 3] for i in range(9)}
+    # SGR 22 ends the faint of the dim frame (a bare color code would keep it and the keys would come out faint gray);
+    # it also ends bold, which fastfetch puts on keys, so bold is set again.
+    bar = sgr(DIM) + "│ " + sgr("22;1;" + ACCENT)
+    # The right edge is placed with an absolute cursor column: the info block starts after the logo (1 left pad,
+    # the widest logo line, 2 right pad); the box is 30 columns wide, so its closing bar is at 1-based column +31.
+    logo_w = max(len(row) for row in art)
+    edge = f"\u001b[{1 + logo_w + 2 + 31}G" + sgr(DIM) + "│\u001b[0m"
+    dots = " ".join(sgr(c) + "●" for c in ("35", "34", "36", "32", "33", "31"))
+    logo_path = f"{OUT}/fastfetch-logo.txt"
+    write(logo_path, "\n".join(mark) + "\n")
+    conf = {
+        "logo": {"type": "file", "source": logo_path, "color": logo_colors, "padding": {"left": 1, "right": 2}},
+        "display": {
+            "separator": "  ",
+            "color": {"keys": ACCENT, "title": ACCENT, "separator": DIM},
+            "percent": {"type": 0},
+        },
+        "modules": [
+            {"type": "title", "format": sgr(ACCENT) + "\u001b[1m{user-name}\u001b[22m" + sgr(DIM) + "@" + sgr("22;" + ACCENT) + "{host-name}\u001b[0m"},
+            {"type": "custom", "format": sgr(DIM) + "┌" + "─" * 29 + "┐\u001b[0m"},
+            {"type": "os", "key": bar + "os  ", "format": "{name} {version-id}" + edge},
+            {"type": "kernel", "key": bar + "ker ", "format": "{release}" + edge},
+            {"type": "wm", "key": bar + "wm  ", "format": "{pretty-name}" + edge},
+            {"type": "shell", "key": bar + "sh  ", "format": "{pretty-name}" + edge},
+            {"type": "uptime", "key": bar + "up  ", "format": "{?days}{days}d {?}{hours}h {minutes}m" + edge},
+            {"type": "memory", "key": bar + "mem ", "format": "{used} / {total}" + edge},
+            {"type": "custom", "format": sgr(DIM) + "│ " + dots + edge},
+            {"type": "custom", "format": sgr(DIM) + "└" + "─" * 29 + "┘\u001b[0m"},
+        ],
+    }
+    return write(f"{OUT}/fastfetch.jsonc", json.dumps(conf, indent=2, ensure_ascii=False) + "\n")
+
+
+def starship():
+    # Minimal single-line prompt; path in the accent, time dim on the right.
+    body = (
+        "# Generated by hs-apps from the hypr-shell tokens, do not edit.\n"
+        'format = "$directory$git_branch $character"\n'
+        'right_format = "$cmd_duration$time"\n'
+        "add_newline = false\n"
+        "\n"
+        "[directory]\n"
+        f'style = "bold fg:{accent}"\n'
+        'format = "[$path]($style)"\n'
+        "truncation_length = 3\n"
+        'truncation_symbol = "…/"\n'
+        'home_symbol = "~"\n'
+        "\n"
+        "[git_branch]\n"
+        f'style = "fg:{secondary}"\n'
+        'format = "[ · $branch]($style)"\n'
+        "\n"
+        "[character]\n"
+        'format = "$symbol "\n'
+        'success_symbol = "[❯](bold fg:' + accent + ')"\n'
+        'error_symbol = "[❯](bold fg:' + pal["danger"] + ')"\n'
+        "\n"
+        "[cmd_duration]\n"
+        "min_time = 2000\n"
+        f'style = "fg:{dim}"\n'
+        'format = "[$duration ]($style)"\n'
+        "\n"
+        "[time]\n"
+        "disabled = false\n"
+        'time_format = "%T"\n'
+        f'style = "fg:{dim}"\n'
+        'format = "[$time]($style)"\n'
+    )
+    return write(f"{HOME}/.config/starship.toml", body)
+
+
+def hyprlock():
+    # Colors and wallpaper for the fallback lock screen (~/.config/hypr-shell/hyprlock.conf sources this file).
+    def hl(h, a=1.0):
+        r, g, b = rgb(h)
+        return "rgba(%02x%02x%02x%02x)" % (r, g, b, round(a * 255))
+
+    wall = os.environ.get("HS_WALLPAPER") or load(f"{HOME}/.local/state/hypr-shell/panel.json").get("wallpaper", "")
+    if not wall:
+        try:
+            with open(f"{HOME}/.local/state/hypr-shell/wallpaper") as f:
+                wall = f.read().strip()
+        except OSError:
+            wall = ""
+    panel = load(f"{HOME}/.local/state/hypr-shell/panel.json").get("color", pal.get("panel", "#2a2a2c"))
+    user = os.environ.get("USER", "")
+    lines = [
+        "# Generated by hs-apps from the hypr-shell tokens, do not edit.",
+        f"$accent = {hl(accent)}",
+        f"$accentText = {hl(accent_text)}",
+        f"$text = {hl(text)}",
+        f"$textDim = {hl(text, 0.55)}",
+        f"$danger = {hl(danger)}",
+        f"$card = {hl(panel, 0.74)}",
+        f"$field = {hl(ink, 0.06)}",
+        f"$line = {hl(ink, 0.08)}",
+        f"$wall = {wall}",
+        f"$avatar = /var/lib/AccountsService/icons/{user}",
+        f"$font = {cfg.get('fonts', {}).get('ui', 'Geist')}",
+    ]
+    return write(f"{OUT}/hyprlock-colors.conf", "\n".join(lines) + "\n")
+
+
+GEN_MARK = "hypr-shell"
+
+
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def firefox_profiles():
+    """Default Firefox profile directories (XDG location first, then the legacy one)."""
+    found = []
+    for root in (f"{HOME}/.config/mozilla/firefox", f"{HOME}/.mozilla/firefox"):
+        ini = read_text(f"{root}/profiles.ini")
+        if not ini:
+            continue
+        cp = configparser.ConfigParser(interpolation=None)
+        cp.read_string(ini)
+        picks = [cp[sec].get("Default") for sec in cp.sections() if sec.startswith("Install") and cp[sec].get("Default")]
+        if not picks:
+            picks = [cp[sec].get("Path") for sec in cp.sections() if sec.startswith("Profile") and cp[sec].get("Default") == "1"]
+        for rel in picks:
+            path = rel if os.path.isabs(rel) else f"{root}/{rel}"
+            if os.path.isdir(path) and path not in found:
+                found.append(path)
+    return found
+
+
+def firefox():
+    changed = False
+    for prof in firefox_profiles():
+        chrome = f"{prof}/chrome"
+        for name, tpl in (("userChrome.css", "firefox-userChrome.css"), ("userContent.css", "firefox-userContent.css")):
+            old = read_text(f"{chrome}/{name}")
+            if old and "generated by hs-apps" not in old:
+                # Keep the previous hand-written file once, next to the generated one.
+                os.makedirs(f"{chrome}/previous", exist_ok=True)
+                shutil.copy2(f"{chrome}/{name}", f"{chrome}/previous/{name}")
+            changed |= write(f"{chrome}/{name}", render(tpl))
+        # user.js: a marked block that wins over earlier prefs (link colors, dark UI, stylesheets on).
+        prefs = [
+            ("toolkit.legacyUserProfileCustomizations.stylesheets", "true"),
+            # 0 is dark, 1 light: browser chrome, pages and about: pages follow the shell's scheme.
+            ("browser.theme.toolbar-theme", "1" if light else "0"), ("browser.theme.content-theme", "1" if light else "0"),
+            ("ui.systemUsesDarkTheme", "0" if light else "1"), ("browser.in-content.dark-mode", "false" if light else "true"),
+            ("browser.display.background_color", f'"{app_bg}"'), ("browser.display.foreground_color", f'"{text}"'),
+            ("browser.display.focus_background_color", f'"{app_high}"'),
+            ("browser.anchor_color", f'"{link}"'), ("browser.visited_color", f'"{secondary}"'),
+            ("browser.active_color", f'"{accent}"'),
+        ]
+        block = "// BEGIN hypr-shell\n" + "".join(f'user_pref("{k}", {v});\n' for k, v in prefs) + "// END hypr-shell\n"
+        js = read_text(f"{prof}/user.js") or ""
+        js = re.sub(r"// BEGIN hypr-shell\n.*?// END hypr-shell\n", "", js, flags=re.S)
+        js += ("" if js.endswith("\n") or not js else "\n") + block
+        changed |= write(f"{prof}/user.js", js)
+    return changed
+
+
+def retint(color):
+    """Map one color of the reference Telegram theme onto the current palette, keeping its lightness role."""
+    h = color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    alpha = h[6:8]
+    hue, sat, val = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+    if sat < 0.16:
+        if val < 0.06:
+            return "#" + h
+        lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+        t = max(0.0, min(1.0, (lum - 0.12) / (0.90 - 0.12)))
+        out = mix(app_bg, text, t)
+    else:
+        deg = hue * 360
+        if deg <= 8 or deg >= 335:
+            target = danger
+        elif 8 < deg <= 58:
+            target = accent
+        elif 150 <= deg <= 260:
+            target = secondary
+        else:
+            return "#" + h
+        th, ts, tv = colorsys.rgb_to_hsv(*(c / 255 for c in rgb(target)))
+        ns = min(1.0, ts * max(0.5, min(1.15, sat / 0.65)))
+        nv = min(1.0, tv * val / 0.86)
+        out = hexs(tuple(c * 255 for c in colorsys.hsv_to_rgb(th, ns, nv)))
+    return out + alpha
+
+
+TG_FLATPAK = f"{HOME}/.var/app/org.telegram.desktop/data/TelegramDesktop"
+
+
+def telegram():
+    from PIL import Image
+
+    body = read_text(f"{TPL}/telegram-colors.tdesktop-theme")
+    colors = re.sub(r"#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?(?![0-9a-zA-Z])", lambda m: retint(m.group(0)), body)
+    # The chat background is a flat dark tone with a faint accent glow, so it follows the wallpaper too.
+    img = Image.new("RGB", (640, 360), rgb(app_bg))
+    glow = Image.radial_gradient("L").resize((640, 360))
+    tint = Image.new("RGB", (640, 360), rgb(mix(app_bg, accent, 0.10)))
+    img = Image.composite(img, tint, glow.point(lambda v: min(255, v * 2)))
+    os.makedirs(f"{OUT}/telegram", exist_ok=True)
+    img.save(f"{OUT}/telegram/background.jpg", quality=90)
+    with open(f"{OUT}/telegram/background.jpg", "rb") as f:
+        bg = f.read()
+    changed = False
+    # The flatpak sandbox cannot read the home directory, so a copy goes into its own data directory too.
+    targets = [f"{OUT}/hypr-shell.tdesktop-theme"]
+    if os.path.isdir(TG_FLATPAK):
+        targets.append(f"{TG_FLATPAK}/hypr-shell.tdesktop-theme")
+    for path in targets:
+        same = False
+        try:
+            with zipfile.ZipFile(path) as z:
+                same = z.read("colors.tdesktop-theme").decode() == colors and z.read("background.jpg") == bg
+        except (OSError, KeyError, zipfile.BadZipFile):
+            pass
+        if same:
+            continue
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("colors.tdesktop-theme", colors)
+            z.writestr("background.jpg", bg)
+        changed = True
+    return changed
+
+
+def telegram_apply():
+    """Ask the running Telegram to preview the generated theme (it still needs one click on Apply)."""
+    if os.path.isdir(TG_FLATPAK):
+        cmd = ["flatpak", "run", "org.telegram.desktop", "-sendpath", f"{TG_FLATPAK}/hypr-shell.tdesktop-theme"]
+    else:
+        cmd = ["telegram-desktop", "-sendpath", f"{OUT}/hypr-shell.tdesktop-theme"]
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def spotify():
+    base = f"{HOME}/.config/spicetify/Themes/System"
+    if not os.path.isdir(f"{HOME}/.config/spicetify"):
+        return False
+    first = read_text(f"{base}/user.css")
+    keep = f"{HOME}/.local/state/hypr-shell/backup-apps/spicetify-System"
+    if first and "generated by hs-apps" not in first and not os.path.exists(keep):
+        shutil.copytree(base, keep)
+    changed = write(f"{base}/color.ini", render("spotify-color.ini"))
+    changed |= write(f"{base}/user.css", render("spotify-user.css"))
+    if changed and shutil.which("spicetify"):
+        # Re-inject in the background; a running Spotify picks it up on its next start.
+        subprocess.Popen(["sh", "-c", "spicetify -q config current_theme System color_scheme Base && spicetify -q apply -n"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return changed
+
+
+def obsidian():
+    vaults = []
+    for conf in (f"{HOME}/.var/app/md.obsidian.Obsidian/config/obsidian/obsidian.json", f"{HOME}/.config/obsidian/obsidian.json"):
+        for v in load(conf).get("vaults", {}).values():
+            if v.get("path") and os.path.isdir(f"{v['path']}/.obsidian") and v["path"] not in vaults:
+                vaults.append(v["path"])
+    changed = False
+    css = render("obsidian.css")
+    for vault in vaults:
+        cfgdir = f"{vault}/.obsidian"
+        changed |= write(f"{cfgdir}/snippets/hypr-shell.css", css)
+        app = load(f"{cfgdir}/appearance.json")
+        enabled = app.get("enabledCssSnippets", [])
+        new = dict(app)
+        if "hypr-shell" not in enabled:
+            new["enabledCssSnippets"] = enabled + ["hypr-shell"]
+        # Obsidian's own base theme ("obsidian" dark, "moonstone" light) follows the scheme; "system" is left alone.
+        if new.get("theme", "obsidian") in ("obsidian", "moonstone"):
+            new["theme"] = "moonstone" if light else "obsidian"
+        if new != app:
+            changed |= write(f"{cfgdir}/appearance.json", json.dumps(new, indent=2) + "\n")
+    return changed
+
+
+def vscode():
+    changed = False
+    ok = pal.get("success", "#8fbf9f")
+    warn = pal.get("warning", "#e5c07b")
+    colors = {
+        "foreground": text, "focusBorder": accent, "descriptionForeground": app_dim, "errorForeground": danger,
+        "selection.background": app_selection, "icon.foreground": app_dim,
+        "editor.background": app_bg, "editor.foreground": text, "editor.selectionBackground": app_selection,
+        "editor.lineHighlightBackground": app_raised, "editor.lineHighlightBorder": "#00000000",
+        "editorLineNumber.foreground": app_mute, "editorLineNumber.activeForeground": text,
+        "editorCursor.foreground": accent, "editorWhitespace.foreground": app_pill,
+        "editorIndentGuide.background1": app_raised, "editorIndentGuide.activeBackground1": app_pill,
+        "editor.findMatchBackground": mix(app_bg, accent, 0.45), "editor.findMatchHighlightBackground": mix(app_bg, accent, 0.25),
+        "editorWidget.background": app_raised, "editorWidget.border": app_pill, "editorSuggestWidget.background": app_raised,
+        "editorSuggestWidget.selectedBackground": app_high, "editorHoverWidget.background": app_raised,
+        "sideBar.background": app_bg, "sideBar.foreground": app_dim, "sideBar.border": app_raised,
+        "sideBarTitle.foreground": text, "sideBarSectionHeader.background": app_bg,
+        "activityBar.background": app_bg, "activityBar.foreground": text, "activityBar.inactiveForeground": app_mute,
+        "activityBar.border": app_raised, "activityBarBadge.background": accent, "activityBarBadge.foreground": accent_text,
+        "titleBar.activeBackground": app_bg, "titleBar.inactiveBackground": app_bg, "titleBar.activeForeground": text,
+        "titleBar.border": app_raised, "statusBar.background": app_bg, "statusBar.foreground": app_dim,
+        "statusBar.border": app_raised, "statusBar.noFolderBackground": app_bg, "statusBar.debuggingBackground": accent,
+        "tab.activeBackground": app_high, "tab.inactiveBackground": app_bg, "tab.activeForeground": text,
+        "tab.inactiveForeground": app_mute, "tab.border": app_bg, "tab.activeBorderTop": accent,
+        "editorGroupHeader.tabsBackground": app_bg, "editorGroup.border": app_raised,
+        "panel.background": app_bg, "panel.border": app_raised, "panelTitle.activeForeground": text,
+        "panelTitle.activeBorder": accent, "panelTitle.inactiveForeground": app_mute,
+        "list.activeSelectionBackground": app_high, "list.activeSelectionForeground": text,
+        "list.inactiveSelectionBackground": app_raised, "list.hoverBackground": app_raised,
+        "list.highlightForeground": accent, "list.focusOutline": accent,
+        "input.background": app_raised, "input.border": app_pill, "input.foreground": text,
+        "inputOption.activeBorder": accent, "dropdown.background": app_raised, "dropdown.border": app_pill,
+        "button.background": accent, "button.foreground": accent_text, "button.hoverBackground": accent_dim,
+        "button.secondaryBackground": app_high, "button.secondaryForeground": text,
+        "badge.background": accent, "badge.foreground": accent_text,
+        "progressBar.background": accent, "scrollbarSlider.background": app_pill + "80",
+        "scrollbarSlider.hoverBackground": app_mute + "80", "scrollbarSlider.activeBackground": app_mute,
+        "menu.background": app_raised, "menu.foreground": text, "menu.selectionBackground": app_high,
+        "notifications.background": app_raised, "notifications.border": app_pill,
+        "terminal.background": app_bg, "terminal.foreground": text, "terminalCursor.foreground": accent,
+        "textLink.foreground": link, "textLink.activeForeground": accent,
+        "gitDecoration.modifiedResourceForeground": warn, "gitDecoration.untrackedResourceForeground": ok,
+        "gitDecoration.deletedResourceForeground": danger, "gitDecoration.conflictingResourceForeground": danger,
+    }
+    colors.update({f"terminal.ansi{n}": ANSI[i] for i, n in enumerate(
+        ("Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White"))})
+    colors.update({f"terminal.ansiBright{n}": ANSI[8 + i] for i, n in enumerate(
+        ("Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White"))})
+    tokens = {"textMateRules": [
+        {"scope": ["comment", "punctuation.definition.comment"], "settings": {"foreground": app_mute, "fontStyle": "italic"}},
+        {"scope": ["keyword", "storage", "storage.type", "keyword.control"], "settings": {"foreground": accent}},
+        {"scope": ["string", "string.quoted"], "settings": {"foreground": ok}},
+        {"scope": ["constant.numeric", "constant.language", "constant.character"], "settings": {"foreground": warn}},
+        {"scope": ["entity.name.function", "support.function", "meta.function-call"], "settings": {"foreground": secondary}},
+        {"scope": ["entity.name.type", "entity.name.class", "support.type", "support.class"], "settings": {"foreground": tertiary}},
+        {"scope": ["variable", "variable.other"], "settings": {"foreground": text}},
+        {"scope": ["keyword.operator", "punctuation"], "settings": {"foreground": app_dim}},
+        {"scope": ["invalid", "markup.deleted"], "settings": {"foreground": danger}},
+    ]}
+    for d in ("VSCodium", "Code - OSS", "Code"):
+        path = f"{HOME}/.config/{d}/User/settings.json"
+        raw = read_text(path)
+        if raw is None:
+            continue
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            print(f"vscode: {path} is not plain JSON, skipped", file=sys.stderr)
+            continue
+        data["workbench.colorCustomizations"] = colors
+        data["editor.tokenColorCustomizations"] = tokens
+        changed |= write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return changed
+
+
+def btop():
+    cfgdir = f"{HOME}/.config/btop"
+    if not os.path.isdir(cfgdir):
+        return False
+
+    t = {
+        "main_bg": "", "main_fg": text, "title": accent, "hi_fg": accent,
+        "selected_bg": app_high, "selected_fg": accent, "inactive_fg": app_mute, "graph_text": app_dim,
+        "meter_bg": app_pill, "proc_misc": accent,
+        "cpu_box": app_pill, "mem_box": app_pill, "net_box": app_pill, "proc_box": app_pill, "div_line": app_pill,
+        "temp_start": pal.get("success", "#8fbf9f"), "temp_mid": pal.get("warning", "#e5c07b"), "temp_end": danger,
+        "cpu_start": secondary, "cpu_mid": accent, "cpu_end": tertiary,
+        "free_start": app_pill, "free_mid": "", "free_end": app_dim,
+        "cached_start": mix(app_bg, secondary, 0.4), "cached_mid": "", "cached_end": secondary,
+        "available_start": mix(app_bg, tertiary, 0.4), "available_mid": "", "available_end": tertiary,
+        "used_start": mix(app_bg, accent, 0.4), "used_mid": "", "used_end": accent,
+        "download_start": mix(app_bg, secondary, 0.4), "download_mid": secondary, "download_end": accent,
+        "upload_start": mix(app_bg, tertiary, 0.4), "upload_mid": tertiary, "upload_end": accent,
+    }
+    body = "# Generated by hs-apps from the hypr-shell tokens, do not edit.\n"
+    body += "".join(f'theme[{k}]="{v}"\n' for k, v in t.items())
+    changed = write(f"{cfgdir}/themes/hypr-shell.theme", body)
+    conf = read_text(f"{cfgdir}/btop.conf")
+    if conf is not None:
+        new = re.sub(r'^color_theme\s*=.*$', 'color_theme = "hypr-shell"', conf, flags=re.M)
+        new = re.sub(r'^rounded_corners\s*=.*$', "rounded_corners = true", new, flags=re.M)
+        changed |= write(f"{cfgdir}/btop.conf", new)
+    if changed:
+        subprocess.run(["pkill", "-USR2", "-x", "btop"], check=False)
+    return changed
+
+
+def mpv():
+    """Colors of mpv's on-screen controller (the built-in OSC): accent seekbar and hover, shell neutrals behind."""
+    cfgdir = f"{HOME}/.config/mpv"
+    if not os.path.isdir(cfgdir):
+        return False
+    # Option names as of mpv 0.42 (osc.lua user_opts); timecode_color paints the progress bar too.
+    opts = {
+        "background_color": app_bg, "title_color": text, "timecode_color": accent,
+        "time_pos_color": text, "time_pos_outline_color": app_bg, "buttons_color": text, "top_buttons_color": text,
+        "small_buttonsL_color": app_dim, "small_buttonsR_color": app_dim, "held_element_color": accent,
+    }
+    body = "# Generated by hs-apps from the hypr-shell tokens, do not edit.\n"
+    body += "".join(f"{k}={v}\n" for k, v in opts.items())
+    return write(f"{cfgdir}/script-opts/osc.conf", body)
+
+
+CURSORS = {"dark": "Bibata-Modern-Ice", "light": "Bibata-Modern-Classic"}
+
+
+def cursor_dir(name):
+    for base in (f"{HOME}/.local/share/icons", f"{HOME}/.icons", "/usr/share/icons"):
+        if os.path.isdir(f"{base}/{name}/cursors"):
+            return base
+    return None
+
+
+def cursor():
+    """Cursor follows the scheme: white Bibata on dark, black on light. Hyprland switches live (clients on the
+    cursor-shape protocol follow at once); GTK reads gsettings; XWayland apps read the default theme or XCURSOR_THEME
+    at start, so they pick up a change on their next launch."""
+    cur = cfg.get("cursor", {})
+    name = cur.get(scheme) or CURSORS[scheme]
+    size = int(cur.get("size", 24))
+    if cur.get("style", "accent") == "accent":
+        # Whole cursor in the wallpaper accent: body = primary, edge and spinner disc = its contrast color, spinner
+        # segments = accent shades. Built by hs-cursor from the Bibata sources; the name carries the colors, so a new
+        # accent is a new theme (Hyprland and apps cache themes by name). Old builds are removed, the previous kept.
+        spin = [accent, lift(accent, 0.45), mix(accent, accent_text, 0.3), lift(accent, 0.8)]
+        args = [accent, accent_text, accent_text, ",".join(spin)]
+        key = "".join(a.lstrip("#").lower() for a in args).replace(",", "")
+        built = f"HS-Cursor-{hashlib.sha1(key.encode()).hexdigest()[:8]}"
+        icons = f"{HOME}/.local/share/icons"
+        if not os.path.isdir(f"{icons}/{built}/cursors"):
+            r = subprocess.run(["hs-cursor", built, *args], capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"hs-apps: hs-cursor failed: {r.stderr.strip()}", file=sys.stderr)
+                built = None
+        if built:
+            previous = (read_text(f"{OUT}/cursor") or "").split()
+            keep = {built, previous[0] if previous else ""}
+            for old in glob.glob(f"{icons}/HS-Cursor-*"):
+                if os.path.basename(old) not in keep:
+                    shutil.rmtree(old, ignore_errors=True)
+            name = built
+    if not cursor_dir(name):
+        print(f"hs-apps: cursor theme {name} is not installed (./install.sh fetches it)", file=sys.stderr)
+        return False
+    changed = write(f"{OUT}/cursor", f"{name} {size}\n")
+    write(f"{HOME}/.local/share/icons/default/index.theme",
+          f"[Icon Theme]\nName=Default\nComment=Set by hypr-shell (hs-apps)\nInherits={name}\n")
+    if shutil.which("gsettings"):
+        schema = "org.gnome.desktop.interface"
+        subprocess.run(["gsettings", "set", schema, "cursor-theme", name], check=False)
+        subprocess.run(["gsettings", "set", schema, "cursor-size", str(size)], check=False)
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        subprocess.run(["hyprctl", "setcursor", name, str(size)], capture_output=True, check=False)
+        # Apps started by systemd or D-Bus activation take the environment from there, not from Hyprland.
+        env = [f"XCURSOR_THEME={name}", f"XCURSOR_SIZE={size}", f"HYPRCURSOR_THEME={name}", f"HYPRCURSOR_SIZE={size}"]
+        subprocess.run(["systemctl", "--user", "set-environment", *env], capture_output=True, check=False)
+        if shutil.which("dbus-update-activation-environment"):
+            subprocess.run(["dbus-update-activation-environment", *env], capture_output=True, check=False)
+    return changed
+
+
+def gtk_switch(on):
+    """on: keep the previous gtk.css aside and make ours the only user stylesheet; off: put the previous one back."""
+    line = '@import url("hypr-shell.css");'
+    block = f"{MARK_BEGIN}\n{line}\n{MARK_END}\n"
+    for v in ("3.0", "4.0"):
+        path = f"{HOME}/.config/gtk-{v}/gtk.css"
+        aside = f"{path}.pre-hypr-shell"
+        css = read_text(path) or ""
+        css = re.sub(re.escape(MARK_BEGIN) + r".*?" + re.escape(MARK_END) + r"\n?", "", css, flags=re.S)
+        if on:
+            if css.strip() and not os.path.exists(aside):
+                write(aside, css)
+            write(path, block)
+        else:
+            previous = read_text(aside)
+            write(path, previous if previous is not None else css)
+            if previous is not None:
+                os.remove(aside)
+        print(f"gtk-{v}: {'enabled' if on else 'disabled'}")
+
+
+if len(sys.argv) >= 3 and sys.argv[1] == "gtk" and sys.argv[2] in ("on", "off"):
+    gtk()
+    gtk_switch(sys.argv[2] == "on")
+    sys.exit(0)
+
+if len(sys.argv) >= 3 and sys.argv[1] == "telegram" and sys.argv[2] == "apply":
+    telegram()
+    telegram_apply()
+    sys.exit(0)
+
+JOBS = {
+    "kitty": kitty, "gtk": gtk, "qt": qt, "fish": fish, "starship": starship, "fastfetch": fastfetch, "hyprlock": hyprlock,
+    "firefox": firefox, "telegram": telegram, "spotify": spotify, "obsidian": obsidian,
+    "vscode": vscode, "btop": btop, "mpv": mpv, "cursor": cursor,
+}
+disabled = set(cfg.get("apps", {}).get("disabled", []))
+wanted = [a for a in sys.argv[1:] if a in JOBS] or [j for j in JOBS if j not in disabled]
+changed = {}
+for job in wanted:
+    try:
+        changed[job] = JOBS[job]()
+    except Exception as e:  # one broken app must not stop the others
+        print(f"hs-apps: {job} failed: {e}", file=sys.stderr)
+
+if changed.get("kitty") and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+    subprocess.run(["pkill", "-USR1", "-x", "kitty"], check=False)
+
+if changed.get("telegram") and cfg.get("apps", {}).get("telegramAutoApply") and subprocess.run(["pgrep", "-x", "Telegram"], capture_output=True).returncode == 0:
+    telegram_apply()
+
+if "gtk" in changed and shutil.which("gsettings"):
+    # The color scheme and the adw-gtk3 variant follow the shell, otherwise GTK draws its own dark widgets under our
+    # light colors (or the reverse) and text disappears. A theme other than adw-gtk3 is the user's and stays.
+    schema = "org.gnome.desktop.interface"
+
+    def gget(key):
+        return subprocess.run(["gsettings", "get", schema, key], capture_output=True, text=True).stdout.strip().strip("'")
+
+    want = "prefer-light" if light else "prefer-dark"
+    theme = gget("gtk-theme")
+    if theme in ("adw-gtk3", "adw-gtk3-dark"):
+        new_theme = "adw-gtk3" if light else "adw-gtk3-dark"
+        if new_theme != theme:
+            subprocess.run(["gsettings", "set", schema, "gtk-theme", new_theme], check=False)
+    cur = gget("color-scheme")
+    if cur and cur != want:
+        subprocess.run(["gsettings", "set", schema, "color-scheme", want], check=False)
+    elif cur and changed.get("gtk") and os.environ.get("WAYLAND_DISPLAY"):
+        # Running GTK apps only re-read gtk.css when the color scheme setting flips, so flip it and put it back.
+        subprocess.run(["gsettings", "set", schema, "color-scheme", "default"], check=False)
+        subprocess.run(["gsettings", "set", schema, "color-scheme", cur], check=False)

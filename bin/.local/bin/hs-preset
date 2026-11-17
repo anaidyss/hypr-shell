@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Apply a static palette preset by writing colors.json and colors.lua.
+
+Reads theme.preset from ~/.config/hypr-shell/theme.json. When it is "matugen"
+the palette comes from the wallpaper and this is a no-op; any other value is
+the basename of a file in ~/.config/hypr-shell/presets/<name>.json.
+Output: ~/.local/state/hypr-shell/colors.json and colors.lua.
+"""
+import json
+import os
+import sys
+
+HOME = os.path.expanduser("~")
+CONF = f"{HOME}/.config/hypr-shell/theme.json"
+STATE = f"{HOME}/.local/state/hypr-shell"
+PRESETS = f"{HOME}/.config/hypr-shell/presets"
+
+ROLES = [
+    "crust", "mantle", "base", "surface0", "surface1", "surface2",
+    "text", "subtext", "outline", "inverseSurface",
+    "primary", "primaryText", "secondary", "tertiary", "error", "errorText",
+]
+
+
+def load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+cfg = load(CONF)
+theme = cfg.get("theme") or {}
+preset = theme.get("preset", "matugen")
+if preset == "matugen":
+    sys.exit(0)
+
+data = load(f"{PRESETS}/{preset}.json")
+if not data:
+    print(f"preset not found: {preset}", file=sys.stderr)
+    sys.exit(1)
+
+os.makedirs(STATE, exist_ok=True)
+data = dict(data)
+data["source"] = f"preset:{preset}"
+data["mode"] = os.environ.get("HS_MODE") or theme.get("mode", "dark")
+if data["mode"] == "auto":
+    data["mode"] = "dark"
+
+with open(f"{STATE}/colors.json", "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+lines = ["return {"]
+for key in ROLES:
+    lines.append(f'    {key} = "{str(data.get(key, "#000000")).lstrip("#")}",')
+lines.append("}")
+with open(f"{STATE}/colors.lua", "w") as f:
+    f.write("\n".join(lines) + "\n")
+
+print(f"preset {preset} applied")

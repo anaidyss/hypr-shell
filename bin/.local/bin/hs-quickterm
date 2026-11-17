@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Small floating terminal sitting in the bottom-left corner of the work area like a tile, sized for fastfetch; the same key closes it again.
+# The window rule "hs-quickterm" (conf/rules.lua) floats it and sets the position.
+set -euo pipefail
+
+CLASS="hs-quickterm"
+addr="$(hyprctl clients -j | jq -r --arg c "$CLASS" '[.[] | select(.class == $c)][0].address // empty')"
+
+if [[ -n "$addr" ]]; then
+    hyprctl dispatch "hl.dsp.window.close({ window = \"address:$addr\" })" >/dev/null
+else
+    # No greeting (fastfetch already says it); about 54x17 cells hold the fastfetch card and a few lines of work.
+    setsid -f kitty --class "$CLASS" \
+        -o initial_window_width=50c -o initial_window_height=16c -o remember_window_size=no \
+        -o window_padding_width=14 \
+        fish -C 'function fish_greeting; end; fastfetch' >/dev/null 2>&1
+fi

@@ -1,0 +1,18 @@
+return {
+    crust = "{{colors.surface_container_lowest.default.hex_stripped}}",
+    mantle = "{{colors.surface.default.hex_stripped}}",
+    base = "{{colors.surface_container_low.default.hex_stripped}}",
+    surface0 = "{{colors.surface_container.default.hex_stripped}}",
+    surface1 = "{{colors.surface_container_high.default.hex_stripped}}",
+    surface2 = "{{colors.surface_container_highest.default.hex_stripped}}",
+    text = "{{colors.on_surface.default.hex_stripped}}",
+    subtext = "{{colors.on_surface_variant.default.hex_stripped}}",
+    outline = "{{colors.outline.default.hex_stripped}}",
+    inverseSurface = "{{colors.inverse_surface.default.hex_stripped}}",
+    primary = "{{colors.primary.default.hex_stripped}}",
+    primaryText = "{{colors.on_primary.default.hex_stripped}}",
+    secondary = "{{colors.secondary.default.hex_stripped}}",
+    tertiary = "{{colors.tertiary.default.hex_stripped}}",
+    error = "{{colors.error.default.hex_stripped}}",
+    errorText = "{{colors.on_error.default.hex_stripped}}",
+}

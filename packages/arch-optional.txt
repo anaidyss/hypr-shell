@@ -1,0 +1,32 @@
+# Arch, optional: the shell works without these (the matching feature is just disabled).
+# emoji menu inserts into the focused window through wtype (without it the emoji is only copied)
+wtype
+# screenshot OCR
+tesseract
+tesseract-data-eng
+tesseract-data-rus
+# wallpaper tools and file converter
+imagemagick
+ffmpeg
+# personal package: VPN (sing-box) and the zh-notes picker (fuzzel)
+# age decrypts the stored sing-box configs (hs-secrets)
+age
+sing-box
+fuzzel
+# AUR only (not installed by the script): spicetify-cli, python-obsws-python (hs-stealthcast)
+# screen recording for hs-demo --record (OBS works too)
+wf-recorder
+# audio spectrum in the Media tab
+cava
+# Spotify (official client, downloaded into ~/.local/share/spotify-launcher, writable for spicetify)
+spotify-launcher
+# filesystems the Drives branch can format (exFAT, FAT32, NTFS, F2FS, XFS, UDF)
+exfatprogs
+dosfstools
+ntfs-3g
+f2fs-tools
+xfsprogs
+udftools
+# Windows installer sticks from the Drives menu (extract the ISO, split install.wim for FAT32)
+7zip
+wimlib

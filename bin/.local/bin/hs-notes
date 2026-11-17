@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+# Quick notes helper for the shell: plain .md files in one folder (an Obsidian vault subfolder by default).
+#   hs-notes list DIR            newest first, one JSON object per line: {path, name, mtime, text}
+#   hs-notes create DIR NAME     creates an empty note (NAME may be empty) and prints its path
+#   hs-notes write PATH TEXT     replaces the content atomically
+#   hs-notes trash PATH          moves the note to the trash
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def safe_name(name):
+    # Characters Obsidian does not allow in a file name.
+    name = re.sub(r'[\\/:*?"<>|#^\[\]]', " ", name)
+    name = " ".join(name.split())[:80].strip(" .")
+    return name or time.strftime("Note %Y-%m-%d %H-%M")
+
+
+def cmd_list(folder):
+    items = []
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        names = []
+    for fn in names:
+        if not fn.endswith(".md") or fn.startswith("."):
+            continue
+        path = os.path.join(folder, fn)
+        try:
+            mtime = os.path.getmtime(path)
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read(2000)
+        except OSError:
+            continue
+        items.append({"path": path, "name": fn[:-3], "mtime": int(mtime * 1000), "text": text})
+    items.sort(key=lambda i: -i["mtime"])
+    for item in items[:300]:
+        print(json.dumps(item, ensure_ascii=False))
+
+
+def cmd_create(folder, name):
+    os.makedirs(folder, exist_ok=True)
+    base = safe_name(name)
+    path = os.path.join(folder, base + ".md")
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(folder, "%s %d.md" % (base, n))
+        n += 1
+    open(path, "w").close()
+    print(path)
+
+
+def cmd_write(path, text):
+    folder = os.path.dirname(path)
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".hs-note-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def main():
+    a = sys.argv[1:]
+    if len(a) >= 2 and a[0] == "list":
+        cmd_list(a[1])
+    elif len(a) >= 2 and a[0] == "create":
+        cmd_create(a[1], a[2] if len(a) > 2 else "")
+    elif len(a) >= 3 and a[0] == "write":
+        cmd_write(a[1], a[2])
+    elif len(a) >= 2 and a[0] == "trash":
+        subprocess.run(["gio", "trash", a[1]], check=False)
+    else:
+        sys.exit(2)
+
+
+main()
